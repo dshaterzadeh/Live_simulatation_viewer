@@ -13,7 +13,7 @@ Two kinds of sensor exist here:
      bounded random walk.  (The file's own `PeopleNumber` is identically zero,
      so occupancy is invented rather than derived.)
 
-Structurally this is a sibling of `hdf5_mqtt_publisher.py`, not a layer on top
+Structurally this is a sibling of `engine.py` + `bridge.py`, not a layer on top
 of it: its own CLI, its own MQTT client, its own pacing.  It deliberately does
 *not* use `ReplayController` — sensors are an always-on stream and have no
 play/pause/seek/speed semantics.  The ground truth is read through

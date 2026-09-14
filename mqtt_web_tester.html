@@ -136,9 +136,9 @@
             accent-color: var(--primary);
             background: transparent;
             border: none;
-            cursor: pointer;
         }
-        .transport input[type=range]:disabled { cursor: not-allowed; opacity: 0.5; }
+        /* Read-only: the federation has no seek, so this is a progress indicator. */
+        .transport input[type=range] { pointer-events: none; cursor: default; }
         .transport select {
             padding: 5px 6px;
             font-size: 0.78rem;
@@ -421,6 +421,21 @@
             box-sizing: border-box;
             font-size: 0.85rem;
         }
+        .setpoint-panel {
+            border-top: 1px solid var(--border);
+            padding-top: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .setpoint-row { display: flex; gap: 6px; }
+        .setpoint-row input { flex: 1; min-width: 0; }
+        .setpoint-row button { padding: 6px 10px; font-size: 0.8rem; }
+        .setpoint-status { font-size: 0.78rem; color: var(--text-muted); font-family: monospace; min-height: 1.1em; }
+        .setpoint-status.applied { color: #fbbf24; }
+        .setpoint-status.rejected { color: #f87171; }
+        .setpoint-active { font-size: 0.75rem; color: var(--text-muted); font-family: monospace; }
+        .setpoint-active div { padding: 2px 0; }
         .building-list {
             flex-grow: 1;
             overflow-y: auto;
@@ -645,8 +660,8 @@
 
     <div class="transport">
         <button id="btnPlayPause" onclick="togglePlayback()" disabled title="Pause / resume the replay">❚❚</button>
-        <input type="range" id="scrubber" min="0" max="0" value="0" step="1" disabled
-               oninput="onScrubInput()" onchange="onScrubRelease()" title="Drag to seek">
+        <input type="range" id="scrubber" min="0" max="0" value="0" step="1" tabindex="-1"
+               title="Replay position (read-only)">
         <span class="scrub-label" id="lblScrub">– / –</span>
         <select id="speedSelect" onchange="onSpeedChange()" disabled title="Playback speed">
             <option value="0.25">0.25×</option>
@@ -741,6 +756,24 @@
             </select>
         </div>
         <button class="secondary" onclick="clearChartHistory('sim')">Clear history</button>
+
+        <div class="setpoint-panel">
+            <label>Setpoint → engine</label>
+            <select id="setpointBuilding" onchange="onSetpointTargetChange()">
+                <option value="">-- building --</option>
+            </select>
+            <select id="setpointTarget" onchange="onSetpointTargetChange()">
+                <option value="building/ZoneSetPoint">Zone setpoint (°C)</option>
+                <option value="heating/Qt">Heat-pump heat output (W)</option>
+            </select>
+            <div class="setpoint-row">
+                <input type="number" id="setpointValue" step="any" placeholder="value">
+                <button id="setpointApply" onclick="applySetpoint()" disabled>Apply</button>
+                <button id="setpointClear" class="secondary" onclick="clearSetpoint()" disabled>Clear</button>
+            </div>
+            <div class="setpoint-status" id="setpointStatus">Waiting for data…</div>
+            <div class="setpoint-active" id="setpointActive"></div>
+        </div>
     </div>
     <div class="chart-main">
         <div class="chart-header">
@@ -838,6 +871,7 @@
             updateChartParameterDropdown(key);
             renderChart(key);
         }
+        if (tab === 'chart') renderSetpointPanel();
         if (tab === 'sensors') {
             buildSensorTableStructure();
             updateSensorTableValues();
@@ -885,6 +919,14 @@
     
     // Track parameters for map dropdown
     let activeParametersList = new Set();
+    // building -> model -> full entity path, e.g. bui_0027_0 -> heating ->
+    // "heating_frassinetto_hp2_proc_0-0.heating_frassinetto_hp2_bui_0027_0".
+    // The setpoint control needs the real entity name the engine knows, not
+    // the dashboard's shortened building/model keys.
+    let entityPathFor = {};
+    // "entity/variable" -> the engine's last retained ack for that target.
+    let setpointAcks = {};
+    let setpointUiDirty = false;
 
     // --- Sensor state (sensors/# namespace) ---
     // Deliberately separate from dataStore: sensor readings carry a status and a
@@ -952,6 +994,7 @@
                 client.subscribe(`${SENSOR_BASE}/#`);
                 setTransportEnabled(true);
                 updateTransportUI();
+                onSetpointTargetChange();
             },
             onFailure: (err) => {
                 document.getElementById('statusText').innerText = 'Failed';
@@ -966,6 +1009,7 @@
         }
         isConnected = false;
         setTransportEnabled(false);
+        onSetpointTargetChange();
         document.getElementById('statusDot').classList.remove('connected');
         document.getElementById('statusText').innerText = 'Disconnected';
         const btn = document.getElementById('connectBtn');
@@ -978,10 +1022,9 @@
         disconnect();
     }
 
-    // --- Transport control (play / pause / seek) ---
+    // --- Transport control (play / pause / speed) ---
     let totalSteps = 0;
     let isPlaying = true;      // the publisher starts playing
-    let isScrubbing = false;
     let runMeta = null;
 
     function controlBase() {
@@ -1001,7 +1044,6 @@
 
     function setTransportEnabled(enabled) {
         document.getElementById('btnPlayPause').disabled = !enabled;
-        document.getElementById('scrubber').disabled = !enabled;
         document.getElementById('speedSelect').disabled = !enabled;
     }
 
@@ -1016,21 +1058,6 @@
         publishControl('speed', { multiplier });
     }
 
-    function onScrubInput() {
-        isScrubbing = true;
-        const step = Number(document.getElementById('scrubber').value);
-        document.getElementById('lblScrub').innerText =
-            `${step} / ${totalSteps ? totalSteps - 1 : '–'}`;
-    }
-
-    function onScrubRelease() {
-        const step = Number(document.getElementById('scrubber').value);
-        isScrubbing = false;
-        publishControl('seek', { step });
-        currentStep = step;      // optimistic, corrected by the next message
-        updateTransportUI();
-    }
-
     function updateTransportUI() {
         const btn = document.getElementById('btnPlayPause');
         btn.innerText = isPlaying ? '❚❚' : '▶';
@@ -1040,11 +1067,9 @@
         if (totalSteps > 0 && Number(scrubber.max) !== totalSteps - 1) {
             scrubber.max = totalSteps - 1;
         }
-        if (!isScrubbing) {
-            scrubber.value = currentStep;
-            document.getElementById('lblScrub').innerText =
-                `${currentStep} / ${totalSteps ? totalSteps - 1 : '–'}`;
-        }
+        scrubber.value = currentStep;
+        document.getElementById('lblScrub').innerText =
+            `${currentStep} / ${totalSteps ? totalSteps - 1 : '–'}`;
     }
 
     // --- Run metadata (provenance) ---
@@ -1089,7 +1114,17 @@
             applyRunMetadata(payload);
             return;
         }
-        if (topicName.indexOf('/_control/') !== -1) return;
+        if (topicName.indexOf('/_control/') !== -1) {
+            // Retained setpoint acks are state, not commands: they tell us
+            // what the engine actually applied, and they arrive on connect.
+            const ack = topicName.match(/\/_control\/setpoint\/(.+)\/ack$/);
+            if (ack && payload && typeof payload === 'object') {
+                setpointAcks[ack[1]] = payload;
+                setpointUiDirty = true;
+                scheduleRender();
+            }
+            return;
+        }
 
         if (!payload.dataset) return;
 
@@ -1097,13 +1132,20 @@
         if (!parsed) return;
 
         const { model, building, variable } = parsed;
+        if (building !== 'Global') {
+            if (!entityPathFor[building]) entityPathFor[building] = {};
+            if (!entityPathFor[building][model]) {
+                entityPathFor[building][model] = payload.dataset.split('/')[0];
+                setpointUiDirty = true;
+            }
+        }
         const val = payload.values;
         const step = payload.step;
 
         logsHistory.unshift(`${step} | ${payload.dataset}: ${val}`);
         if (logsHistory.length > 50) logsHistory.pop();
 
-        // Assigned unconditionally: a seek can move the replay backwards.
+        // Assigned unconditionally: a --loop wrap moves the replay backwards.
         currentStep = step;
         if (typeof payload.total_steps === 'number') totalSteps = payload.total_steps;
         if (model === 'time' && variable === 't') currentTime = val;
@@ -1324,6 +1366,10 @@
             buildTableStructure();
             if (activeTab === 'chart') renderBuildingList('sim');
             structureChanged = false;
+        }
+        if (setpointUiDirty && activeTab === 'chart') {
+            renderSetpointPanel();
+            setpointUiDirty = false;
         }
 
         if (sensorStructureChanged) {
@@ -1841,6 +1887,91 @@
     // what makes the rendered view reproducible.
     const CHART_CTX = {};
 
+    // --- Setpoint control (Live Chart sidebar) ---
+    // Publishes to sim/coesi5/_control/setpoint/<entity>/<variable>; the bridge
+    // forwards it into the HELICS federation and the engine's retained ack on
+    // <...>/ack is the only thing this panel ever displays as "applied". A
+    // reload therefore shows the true applied state, not the last click.
+    function setpointEntity() {
+        const b = document.getElementById('setpointBuilding').value;
+        const [model, variable] = document.getElementById('setpointTarget').value.split('/');
+        const entity = ((entityPathFor[b] || {})[model]) || null;
+        return { building: b, model, variable, entity };
+    }
+
+    function renderSetpointPanel() {
+        const sel = document.getElementById('setpointBuilding');
+        const current = sel.value;
+        const options = Array.from(buildings).filter(b => b !== 'Global').sort();
+        sel.innerHTML = '<option value="">-- building --</option>' +
+            options.map(b => `<option value="${b}">${b}</option>`).join('');
+        if (options.indexOf(current) !== -1) sel.value = current;
+        else if (!current && options.indexOf('bui_0027_0') !== -1) sel.value = 'bui_0027_0';
+        onSetpointTargetChange();
+
+        // Every override the engine currently holds, from the retained acks.
+        const active = Object.entries(setpointAcks)
+            .filter(([, a]) => a && a.accepted && a.applied !== null && a.applied !== undefined)
+            .map(([k, a]) => {
+                const bm = k.match(/bui_\d+(_\d+)?/);
+                return `<div>⚙ ${bm ? bm[0] : k.split('/')[0]} · ${a.variable} = <b>${fmtVal(a.applied)}</b></div>`;
+            });
+        document.getElementById('setpointActive').innerHTML =
+            active.length ? '<div style="margin-top:4px;">Active overrides:</div>' + active.join('') : '';
+    }
+
+    function onSetpointTargetChange() {
+        const { entity, variable } = setpointEntity();
+        const status = document.getElementById('setpointStatus');
+        const canSend = isConnected && !!entity;
+        document.getElementById('setpointApply').disabled = !canSend;
+        document.getElementById('setpointClear').disabled = !canSend;
+        status.className = 'setpoint-status';
+        if (!entity) {
+            status.innerText = buildings.size ? 'No such entity seen yet' : 'Waiting for data…';
+            return;
+        }
+        const ack = setpointAcks[`${entity}/${variable}`];
+        if (!ack) { status.innerText = 'no override'; return; }
+        if (!ack.accepted) {
+            status.classList.add('rejected');
+            status.innerText = `rejected: ${ack.reason || 'unknown'}`;
+        } else if (ack.applied === null || ack.applied === undefined) {
+            status.innerText = `no override (cleared at step ${ack.step})`;
+        } else {
+            status.classList.add('applied');
+            status.innerText = `applied ${fmtVal(ack.applied)} at step ${ack.step}` +
+                (ack.reason ? ` — ${ack.reason}` : '');
+            document.getElementById('setpointValue').placeholder = String(ack.applied);
+        }
+    }
+
+    function publishSetpoint(entity, variable, value) {
+        if (!isConnected || !client) return;
+        const msg = new Paho.MQTT.Message(JSON.stringify({ value }));
+        msg.destinationName = `${controlBase()}/_control/setpoint/${entity}/${variable}`;
+        msg.qos = 1;
+        try { client.send(msg); } catch (e) { console.warn("Setpoint publish failed:", e); }
+        const status = document.getElementById('setpointStatus');
+        status.className = 'setpoint-status';
+        status.innerText = value === null ? 'clearing… (waiting for engine ack)' : `sent ${value}… (waiting for engine ack)`;
+    }
+
+    function applySetpoint() {
+        const { entity, variable } = setpointEntity();
+        const raw = document.getElementById('setpointValue').value;
+        if (!entity || raw === '') return;
+        const value = Number(raw);
+        if (!Number.isFinite(value)) return;
+        publishSetpoint(entity, variable, value);
+    }
+
+    function clearSetpoint() {
+        const { entity, variable } = setpointEntity();
+        if (!entity) return;
+        publishSetpoint(entity, variable, null);
+    }
+
     function makeChartContext(cfg) {
         const ctx = Object.assign({
             history: {},
@@ -2019,7 +2150,7 @@
     }
 
     // Lowest index whose step is >= the target, i.e. where the target belongs if absent.
-    // Binary search rather than a scan: seek/loop mean arrival order is no longer step
+    // Binary search rather than a scan: a --loop wrap means arrival order is no longer step
     // order, and this runs once per incoming message across ~175 topics per step.
     function historyInsertionPoint(series, step) {
         let lo = 0, hi = series.length;
@@ -2036,7 +2167,7 @@
         if (!ctx.history[paramKey][building]) ctx.history[paramKey][building] = [];
         const series = ctx.history[paramKey][building];
         // The series is kept sorted by step so renderChart's polyline always runs
-        // left-to-right, even when a seek or a --loop wrap replays earlier steps.
+        // left-to-right, even when a --loop wrap replays earlier steps.
         // Storage stays step-keyed even when the axis is time: step is the
         // monotonic, integral key the ordering and decimation fixes depend on.
         const i = historyInsertionPoint(series, step);

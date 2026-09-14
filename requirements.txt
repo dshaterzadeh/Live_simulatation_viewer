@@ -4,3 +4,6 @@ h5py==3.16.0
 numpy==2.2.6
 paho-mqtt==2.1.0
 rich==15.0.0
+# HELICS co-simulation framework: the engine ↔ bridge federation. The wheel also
+# ships the helics_broker binary, so no separate helics-apps package is needed.
+helics==3.6.1

@@ -3,10 +3,14 @@
 
 > **Scope of this document.** Every component, every data structure, every algorithm,
 > and every contract in the platform, described at implementation level with pointers
-> to the exact source locations. Written against the tree as it stands on 2026-07-30,
-> **after the replay-controller refactor** — the publisher is now three layers
-> (`datasources/` → `replay/` → `hdf5_mqtt_publisher.py`), the replay is
-> interactively controllable over MQTT, and every run publishes its own provenance.
+> to the exact source locations. Written against the tree as it stands on 2026-09-14,
+> **after the HELICS split** — the old publisher is now an engine federate
+> (`datasources/` → `replay/` → `engine.py`) and a bridge federate (`bridge.py`)
+> joined by `federation.py`; the replay is interactively controllable over MQTT,
+> setpoints from the dashboard change what the engine publishes next and are
+> acknowledged, and every run publishes its own provenance. Line-number pointers
+> into the retired `hdf5_mqtt_publisher.py` are kept where the code moved verbatim
+> into `bridge.py`; treat them as "the same function, now in bridge.py".
 
 ---
 
@@ -16,7 +20,8 @@
 2. [System topology](#2-system-topology)
 3. [File-by-file inventory](#3-file-by-file-inventory)
 4. [The data model: inside the HDF5 file](#4-the-data-model-inside-the-hdf5-file)
-5. [Component 1 — The Publisher](#5-component-1--the-publisher-hdf5_mqtt_publisherpy)
+5. [Component 1 — The Engine's replay core](#5-component-1--the-engines-replay-core-datasources--replay-and-where-the-publisher-went)
+5B. [Component 1c — The HELICS federation](#5b-component-1c--the-helics-federation-federationpy-enginepy-bridgepy-helics_brokerpy)
 5A. [Component 1b — The Sensor Simulator](#5a-component-1b--the-sensor-simulator-sensor_simulatorpy)
 6. [The wire contract: topics and payloads](#6-the-wire-contract-topics-and-payloads)
 7. [Component 2 — The Broker](#7-component-2--the-broker-mosquitto)
@@ -57,11 +62,11 @@ Three properties define the design:
 
 | Property | Consequence |
 |---|---|
-| **Schema-free discovery** | Neither the publisher nor the dashboard hard-codes any entity or variable name. Both discover the topology by walking what they receive. |
+| **Schema-free discovery** | Neither the bridge nor the dashboard hard-codes any entity or variable name. Both discover the topology by walking what they receive. |
 | **Zero-suppression** | 114 of 289 datasets in the reference file are identically zero for all 4320 steps. They are never transmitted at all. |
 | **Fan-out topics** | Every `(entity, variable)` pair gets its own MQTT topic, so subscribers can filter at the broker rather than in application code. |
 | **Swappable source** | Reading, pacing and publishing are three separate layers behind the `SimulationDataSource` ABC, so a different backend (InfluxDB, a live solver) replaces only the source. |
-| **Interactive transport** | The replay is not fire-and-forget: play/pause/seek/speed arrive as MQTT control messages, because researchers inspect specific moments rather than watch playback. |
+| **Interactive transport** | The replay is not fire-and-forget: play/pause/speed and setpoints arrive as MQTT control messages, because researchers inspect specific moments rather than watch playback. |
 
 ---
 
@@ -71,14 +76,20 @@ Three properties define the design:
 flowchart LR
     HDF["20260623_baseline.hdf5<br/>289 datasets × 4320 steps"]
 
-    subgraph Backend["Backend (Docker, --network host)"]
+    subgraph Fed["HELICS federation (Docker Compose)"]
         DS["datasources/hdf5_source.py<br/>HDF5DataSource (only h5py importer)"]
-        RC["replay/controller.py<br/>ReplayController — pacing + transport"]
-        PUB["hdf5_mqtt_publisher.py<br/>zero filter + MQTT publish + CLI"]
-        BRK(("Mosquitto<br/>eclipse-mosquitto"))
+        RC["replay/controller.py<br/>ReplayController — pacing + on_tick"]
+        ENG["engine.py<br/>engine federate: replay, apply_control, acks"]
+        HB(("helics_broker.py<br/>zmq :23404"))
+        BRG["bridge.py<br/>bridge federate: zero filter, payload, _control/*"]
     end
 
-    subgraph Serving["Local serving (host python3)"]
+    subgraph MQ["MQTT (Docker Compose)"]
+        BRK(("Mosquitto<br/>:1883 TCP · :9001 WS"))
+        SEN["sensor_simulator.py<br/>sensors/#"]
+    end
+
+    subgraph Serving["Serving (Docker Compose)"]
         SRV["local_server.py<br/>static files + /proxy/"]
     end
 
@@ -90,28 +101,38 @@ flowchart LR
     TERM["mqtt_tester.py<br/>Rich TUI subscriber"]
 
     HDF -->|h5py read, in-memory| DS
+    HDF --> SEN
     DS -->|"read_step(step)"| RC
-    RC -->|"(step, {entity: {var: value}})"| PUB
-    PUB -->|"MQTT/TCP :1883<br/>sim/coesi5/#<br/>+ retained _meta/run"| BRK
-    BRK -->|"MQTT/TCP :1883<br/>sim/coesi5/_control/#"| RC
+    RC -->|"(step, {entity: {var: value}})"| ENG
+    ENG -->|"engine/run (once) · engine/step (per step)"| HB
+    HB -->|"HELICS values"| BRG
+    BRG -->|"EP_ENGINE messages<br/>play · pause · speed · setpoint"| HB
+    HB -->|"EP_BRIDGE messages<br/>setpoint_ack · bye"| BRG
+    BRG -->|"MQTT/TCP :1883<br/>sim/coesi5/# + retained _meta/run<br/>+ retained _control/setpoint/…/ack"| BRK
+    BRK -->|"sim/coesi5/_control/#"| BRG
+    SEN -->|"MQTT/TCP :1883"| BRK
     BRK -->|"MQTT/WebSocket :9001"| DASH
-    DASH -->|"play · pause · seek · speed<br/>sim/coesi5/_control/*"| BRK
+    DASH -->|"play · pause · speed · setpoint<br/>sim/coesi5/_control/*"| BRK
     BRK -->|"MQTT/TCP :1883"| TERM
     SRV -->|"HTTP :8002 — HTML/JS"| DASH
     DASH -->|"GET /proxy/&lt;urlencoded&gt;"| SRV
     SRV -->|"server-side HTTP fetch"| EXT
 ```
 
+
 ### Why each hop exists
 
-- **Publisher → Broker over TCP 1883.** Native MQTT; the publisher is a normal
-  backend process with no browser constraints.
-- **Broker → Publisher over TCP 1883 (the control loop).** The `ReplayController`
-  opens a *second*, independent MQTT connection subscribed to `sim/coesi5/_control/#`
-  ([replay/controller.py:171-208](replay/controller.py#L171-L208)). Transport commands
-  therefore travel the same broker as the telemetry — no side channel, no HTTP server
-  in the publisher, and any MQTT client (the dashboard, `mosquitto_pub`, a notebook)
-  can drive the replay.
+- **Engine ↔ Bridge over HELICS.** The engine is a federate that publishes one
+  value per step and owns a control endpoint; the bridge is the federate that turns
+  values into MQTT and MQTT into endpoint messages. The HELICS broker between them is
+  the seam a real simulation engine plugs into (§5B).
+- **Bridge → Mosquitto over TCP 1883.** Native MQTT; the bridge is a normal backend
+  process with no browser constraints.
+- **Mosquitto → Bridge over the same connection (the control loop).** The bridge
+  subscribes to `sim/coesi5/_control/#` on its one Paho client and forwards commands
+  into the federation. Transport commands and setpoints therefore travel the same
+  broker as the telemetry — no side channel, no HTTP server, and any MQTT client (the
+  dashboard, `mosquitto_pub`, a notebook) can drive the replay or push a setpoint.
 - **Broker → Browser over WebSocket 9001.** Browsers cannot open raw TCP sockets.
   Mosquitto is therefore configured with *two independent listeners* on the same
   broker core, so a message published on 1883 is routed to a subscriber on 9001
@@ -130,17 +151,20 @@ flowchart LR
 
 | Path | Role | Lines |
 |---|---|---|
-| [hdf5_mqtt_publisher.py](hdf5_mqtt_publisher.py) | Wiring + MQTT layer: connection lifecycle, zero filter, payload build, CLI | 420 |
 | [datasources/base.py](datasources/base.py) | `SimulationDataSource` ABC — the swappable data-source contract | 36 |
 | [datasources/hdf5_source.py](datasources/hdf5_source.py) | `HDF5DataSource` — the only module in the tree that imports `h5py` | 202 |
-| [replay/controller.py](replay/controller.py) | `ReplayController` — pacing, play/pause/seek/speed, run metadata | 249 |
+| [replay/controller.py](replay/controller.py) | `ReplayController` — pacing, play/pause/speed, `on_tick`, run metadata | 249 |
 | [sensor_simulator.py](sensor_simulator.py) | Synthetic sensor stream: noise, drift, dropouts, faults, per-type cadence | 812 |
 | [mqtt_web_tester.html](mqtt_web_tester.html) | Entire frontend — CSS, markup and all JS in one file, zero build step | 2139 |
 | [mqtt_tester.py](mqtt_tester.py) | Terminal subscriber with Rich live table, stats panel, sparkline | 315 |
+| [federation.py](federation.py) | The HELICS contract: publication/endpoint names, payload shapes, `TIME_DELTA`, federate factory | 95 |
+| [engine.py](engine.py) | Engine federate: HDF5 replay through `ReplayController`, `apply_control` seam, setpoint acks | 290 |
+| [bridge.py](bridge.py) | Bridge federate: HELICS → MQTT telemetry (relocated publisher body), MQTT `_control/#` → HELICS | 390 |
+| [helics_broker.py](helics_broker.py) | In-process HELICS broker with readiness sentinel; recycles after each federation | 95 |
 | [local_server.py](local_server.py) | Threaded static file server + `/proxy/` CORS-stripping reverse proxy, loopback-bound by default | 43 |
 | [mosquitto.conf](mosquitto.conf) | Dual-listener broker config (TCP + WebSockets, anonymous) | 6 |
-| [Dockerfile](Dockerfile) | Publisher/sensor image: python:3.11-slim + pinned `requirements.txt` + data | 18 |
-| [docker-compose.yml](docker-compose.yml) | The whole stack: broker (health-checked) → publisher, sensors, frontend | 78 |
+| [Dockerfile](Dockerfile) | One image for engine/bridge/helics-broker/sensors: python:3.11-slim + pinned `requirements.txt` + data | 18 |
+| [docker-compose.yml](docker-compose.yml) | The whole stack: mosquitto + helics-broker (health-checked) → engine, bridge, sensors, frontend | 120 |
 | [run.sh](run.sh) | The one entry point: `up / down / restart / status / logs / dev` | 100 |
 | [requirements.txt](requirements.txt) | Pinned runtime deps, shared by the image and the host `.venv` | 6 |
 | [20260623_baseline.hdf5](20260623_baseline.hdf5) | Reference simulation output, 10.2 MB | — |
@@ -248,28 +272,33 @@ building↔heat-pump association independently, by regex on the entity name (§9
 
 ---
 
-## 5. Component 1 — The Publisher (`hdf5_mqtt_publisher.py` + `datasources/` + `replay/`)
+## 5. Component 1 — The Engine's replay core (`datasources/` + `replay/`) and where the publisher went
 
-The only stateful compute in the system, split across **three layers with one
-dependency direction**:
+> **History.** Until the HELICS split, one process — `hdf5_mqtt_publisher.py` — read
+> the file, paced itself and published to MQTT. It is retired. Its *reading and pacing*
+> half now lives in the engine federate ([engine.py](engine.py)); its *publishing* half
+> was relocated close to verbatim into the bridge federate ([bridge.py](bridge.py)); the
+> two talk over HELICS (§5B). This chapter keeps the parts that did not move.
+
+The stateful compute is split across **layers with one dependency direction**:
 
 ```
-datasources/  →  replay/  →  hdf5_mqtt_publisher.py
- what the data     when a       how a step becomes
- is                step fires   MQTT messages
+datasources/  →  replay/  →  engine.py  ═══HELICS═══  bridge.py  →  MQTT
+ what the data     when a       replay +               how a step
+ is                step fires   control seam           becomes messages
 ```
 
 | Layer | Module | Owns | Must not know about |
 |---|---|---|---|
-| Source | [datasources/hdf5_source.py](datasources/hdf5_source.py) | h5py, discovery, in-RAM arrays, provenance | pacing, MQTT |
-| Transport | [replay/controller.py](replay/controller.py) | pacing, play/pause/seek/speed, run metadata | h5py, topics, payload shape |
-| Publish | [hdf5_mqtt_publisher.py](hdf5_mqtt_publisher.py) | connection lifecycle, zero filter, payload build, CLI | file formats, timing |
+| Source | [datasources/hdf5_source.py](datasources/hdf5_source.py) | h5py, discovery, in-RAM arrays, provenance | pacing, HELICS, MQTT |
+| Pacing | [replay/controller.py](replay/controller.py) | pacing, play/pause/speed state, `on_tick`, run metadata | h5py, HELICS, MQTT, topics |
+| Engine | [engine.py](engine.py) | the federation's clock, the control seam, acks, CLI | MQTT, topics, payload shape |
+| Bridge | [bridge.py](bridge.py) | MQTT lifecycle, zero filter, payload build, `_control/#`, CLI | file formats, timing, `datasources/`, `replay/` |
 
-`hdf5_mqtt_publisher.py` imports `h5py` **nowhere** — the import lives only in
+`engine.py` and `bridge.py` import `h5py` **nowhere** — the import lives only in
 `datasources/hdf5_source.py`, which is the mechanical guarantee that the source layer
-is swappable. `main()` constructs `HDF5DataSource(args.file)`, hands it to a
-`ReplayController`, and the publish loop then iterates `controller.steps()`
-([hdf5_mqtt_publisher.py:352-420](hdf5_mqtt_publisher.py#L352-L420)).
+is swappable. `replay/` imports neither `paho.mqtt` nor `helics`: it is pure pacing.
+
 
 ### 5.0 The source contract: `SimulationDataSource`
 
@@ -287,8 +316,8 @@ implementation:
 
 `read_step` is the whole point: it is the only method on the hot path, and it is
 **index-shaped, not stream-shaped**. A source is asked for an arbitrary step at any
-time, which is exactly what seeking and scrubbing require and what a `for row in
-file:`-style reader could never support. An `InfluxDataSource` would implement it as a
+time — what `--start-step`, a `--loop` wrap, and any future seek require, and what a
+`for row in file:`-style reader could never support. An `InfluxDataSource` would implement it as a
 range query; it is deliberately *not* implemented here (out of scope).
 
 `HDF5DataSource` ([datasources/hdf5_source.py:140-202](datasources/hdf5_source.py#L140-L202))
@@ -360,11 +389,12 @@ The `try/except ValueError` around `.item()` guards multi-element arrays, where
 Because `read_step()` now converts on the way out
 ([datasources/hdf5_source.py:178-185](datasources/hdf5_source.py#L178-L185)), everything
 downstream of the source layer is already plain Python — the publish layer never touches
-NumPy, which is why `import numpy` no longer appears in `hdf5_mqtt_publisher.py`.
+NumPy, which is why `import numpy` appears in neither `engine.py` nor `bridge.py` — and
+why a step survives `json.dumps` into a HELICS string publication unchanged.
 
-### 5.4 Connection lifecycle
+### 5.4 Connection lifecycle (now in `bridge.py`)
 
-[hdf5_mqtt_publisher.py:57-146](hdf5_mqtt_publisher.py#L57-L146)
+Relocated verbatim from `hdf5_mqtt_publisher.py:57-146` into [bridge.py](bridge.py).
 
 Paho's **v2 callback API** (`mqtt.CallbackAPIVersion.VERSION2`) is used throughout —
 note the different callback signatures versus v1, in particular `reason_code` replacing
@@ -378,29 +408,34 @@ case it stops the loop and raises `RuntimeError`. This guarantees no publish is 
 attempted against a half-open socket.
 
 There are **two client objects** in a default run: the publish client built by
-`build_mqtt_client` ([:104-114](hdf5_mqtt_publisher.py#L104-L114)), and the controller's
+`build_mqtt_client` (old publisher lines 104-114, now in bridge.py), and the controller's
 own control-listener client ([replay/controller.py:171-208](replay/controller.py#L171-L208)),
 which uses client id `<client-id>_control` and its own connect barrier (a
 `threading.Event` released from `on_connect` after the SUBSCRIBE is issued). Keeping
 them separate means an unavailable control listener degrades to a plain uncontrollable
 replay — `main()` logs a warning and continues
-([:381-390](hdf5_mqtt_publisher.py#L381-L390)) — rather than aborting the run.
+(old publisher lines 381-390, now in bridge.py) — rather than aborting the run.
 
 `_on_publish` is intentionally an empty function
-([:93-101](hdf5_mqtt_publisher.py#L93-L101)) — at ~175 publishes per step and 9 ms
+(old publisher lines 93-101, now in bridge.py) — at ~175 publishes per step and 9 ms
 steps, logging each one would be ~19 000 log lines/second and would itself become the
 bottleneck.
 
 Logging is configured with `force=True` and `sys.stdout.reconfigure(line_buffering=True)`
-([:41-50](hdf5_mqtt_publisher.py#L41-L50)) so that `docker logs` shows progress live
+(old publisher lines 41-50, now in bridge.py) so that `docker logs` shows progress live
 rather than in 8 KB block flushes. All three modules log to the **same**
 `hdf5_mqtt_publisher` logger, so controller and source lines interleave with publish
 progress in one stream.
 
-### 5.5 The publish loop: `publish_time_series`
+### 5.5 The publish loop: `publish_time_series` → `bridge.publish_step`
 
-[hdf5_mqtt_publisher.py:181-249](hdf5_mqtt_publisher.py#L181-L249) — now a pure
-translation layer with **no pacing of its own**:
+Relocated from `hdf5_mqtt_publisher.py:181-249` into `bridge.publish_step`
+([bridge.py](bridge.py)) with one change of shape: the per-step body is a function of
+`(step, n_steps, step_values, catalog, has_been_nonzero)` and is called from the bridge's
+HELICS grant loop instead of from `for step, step_values in controller.steps()`. The
+zero-filter set, topic construction, payload dict, `allow_nan=False` and
+`client.publish` are the same lines. It is a pure translation layer with **no pacing of
+its own**:
 
 ```python
 for step, step_values in controller.steps():          # ── pacing lives in the controller
@@ -438,13 +473,13 @@ table **grows columns while you watch** — `ghi` materialises at step 44, and `
 step 1 — and why nothing ever silently freezes afterwards.
 
 The filter **stayed in the publish layer** rather than moving into the controller: it is
-a property of what gets *transmitted*, not of when a step fires, and a scrubbing user
-must not have the latch state depend on which steps they happened to visit. Note the
-consequence — seeking to step 2000 does not retroactively latch variables that would
-have activated at step 44; a variable latches the first time a *published* step shows it
+a property of what gets *transmitted*, not of when a step fires, and the latch state
+must not depend on which steps happened to be visited. Note the consequence — a run
+started with `--start-step 2000` does not retroactively latch variables that would have
+activated at step 44; a variable latches the first time a *published* step shows it
 non-zero.
 
-`_is_nonzero` ([hdf5_mqtt_publisher.py:153-160](hdf5_mqtt_publisher.py#L153-L160))
+`_is_nonzero` (old publisher lines 153-160, now in bridge.py)
 replaces the old `np.any(step_data != 0)` now that values reach this layer as plain
 Python: it recurses into lists and falls back to `bool(value)` for exotic types,
 producing identical decisions on the reference file.
@@ -476,12 +511,9 @@ unconditionally on `time.sleep`:
 step = self.start_step
 while True:
     with self._state_lock:
-        target, self._seek_target = self._seek_target, None   # consume a pending seek
         paused = self._paused
-    if target is not None:
-        step = target
     if paused:
-        self._wait(_TICK); continue          # connection stays open, nothing advances
+        self._wait(_TICK); continue          # on_tick keeps running, nothing advances
     if step > self.end_step:
         if not self.loop: break
         step = self.start_step; continue
@@ -499,13 +531,15 @@ Four design points:
   mutator `.set()`s. A pause issued during a 1 s delay takes effect in ≤50 ms rather
   than at the end of the delay, and a delay *shorter* than a tick (the 9 ms production
   setting) still sleeps exactly once for its true duration.
-- **Seek is consume-once and wins over the increment.** `step += 1` runs after the
-  yield unconditionally; a seek that landed during the sleep is applied at the next
-  loop top and overwrites it. So `seek {"step": 2000}` publishes step 2000 next, never
-  step 2000 + 1.
-- **State is lock-guarded** because the mutators run on the control listener's Paho
-  network thread while `steps()` runs on the main thread. The lock is held only for
-  field reads/writes, never across a sleep or a source read.
+- **There is no seek.** A HELICS federation's clock only moves forward, so the seek
+  target, its consume-once branch and the `_control/seek` command were removed with the
+  split rather than emulated. A `--loop` wrap is the only backwards movement left.
+- **`on_tick` runs inside every wait slice**, playing or paused. It is how the engine
+  advances HELICS time and drains its endpoint without pacing leaving this module —
+  and it is what makes a `play` deliverable to a paused engine (§5B.3).
+- **State is still lock-guarded**, though today every mutator is called from the main
+  thread (inside `on_tick`). The lock is cheap insurance for a future transport that
+  calls `play()` from another thread; it is held only for field reads/writes.
 - **Reads are synchronous inside the paced loop.** No prefetch thread — deliberate:
   the HDF5 source is a pure in-RAM index, so a buffer would add threading complexity
   for no measurable gain. That optimisation is deferred until a slower backend exists.
@@ -514,28 +548,32 @@ Speed is a *multiplier*, applied as `delay / speed` — `{"multiplier": 2.0}` ha
 effective delay. `set_speed` rejects non-positive multipliers with a warning rather than
 dividing by zero ([:87-96](replay/controller.py#L87-L96)).
 
-### 5.7 The control listener
+### 5.7 The control listener (now in `bridge.py`)
 
-[replay/controller.py:171-249](replay/controller.py#L171-L249). `start_control_listener`
-opens a second Paho connection, subscribes to `<base_topic>/_control/#`, and blocks up
-to 10 s on a connect barrier before returning. `_on_control_message` dispatches on the
-**last topic segment**, tolerating empty and malformed payloads (both degrade to `{}`):
+`ReplayController` no longer owns an MQTT connection. The listener moved to
+`Bridge.subscribe_control` / `_on_control_message` ([bridge.py](bridge.py)): it
+subscribes to `<base_topic>/_control/#` on the bridge's *one* Paho client, parses the
+topic **relative to `_control/`**, tolerates empty and malformed payloads (both degrade
+to `{}`), and queues a HELICS endpoint message that the engine dispatches:
 
-| Command | Payload | Effect |
+| Command topic | Payload | Engine effect |
 |---|---|---|
-| `play` | *(ignored)* | clears the paused flag, wakes the sleeper |
-| `pause` | *(ignored)* | sets the paused flag; the broker connection stays open |
-| `seek` | `{"step": 2000}` | clamped to `[start_step, end_step]`, applied at the next loop top |
-| `speed` | `{"multiplier": 2.0}` | scales the configured delay |
+| `_control/play` | *(ignored)* | `controller.play()` |
+| `_control/pause` | *(ignored)* | `controller.pause()`; HELICS time keeps ticking |
+| `_control/speed` | `{"multiplier": 2.0}` | `controller.set_speed()` |
+| `_control/setpoint/<entity>/<variable>` | `{"value": 26}` / empty or `{"value": null}` to clear | override applied via `apply_control` (§5B.4); retained ack on `…/ack` |
 
+There is deliberately **no `seek` branch** — not stubbed, not deprecated, absent.
 Unknown commands and payloads missing their required field are logged as warnings and
-otherwise ignored — an unrecognised control message can never stall the replay.
+otherwise ignored — an unrecognised control message can never stall the replay. The
+bridge ignores its own `…/ack` topics, which come back on the same wildcard.
+
 
 ### 5.8 Run provenance: `sim/coesi5/_meta/run`
 
-`ReplayController.get_run_metadata()` ([:145-169](replay/controller.py#L145-L169)) merges
+`ReplayController.get_run_metadata()` merges
 whatever `source.get_run_metadata()` returns with the replay configuration, and
-`publish_run_metadata` ([hdf5_mqtt_publisher.py:163-178](hdf5_mqtt_publisher.py#L163-L178))
+`publish_run_metadata` (old publisher lines 163-178, now in bridge.py)
 emits it once, **before the first step**, with `retain=True` and **`qos=1`**:
 
 ```json
@@ -557,49 +595,186 @@ time axis (`t[1] - t[0]`), not hard-coded.
 
 ### 5.9 CLI surface
 
-[hdf5_mqtt_publisher.py:252-349](hdf5_mqtt_publisher.py#L252-L349)
+Two CLIs now, split along the federation boundary. Every pre-split flag kept its name,
+default and meaning; it just lives on the side that uses it.
+
+**`engine.py`** — the file and the pace:
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--file` / `-f` | *(required)* | HDF5 input path |
 | `--explore` | off | Dump dataset tree and exit |
-| `--host` | `localhost` | Broker host |
-| `--port` | `1883` | Broker TCP port |
-| `--topic` / `-t` | `sim/hdf5/data` | Base topic prefix (also roots `_control/*` and `_meta/run`) |
-| `--qos` | `0` | 0, 1 or 2 — telemetry only; `_meta/run` is always QoS 1 |
-| `--client-id` | `hdf5_publisher` | MQTT client identifier (control listener appends `_control`) |
-| `--delay` | `1.0` | Seconds between steps — the *baseline* pace, which `_control/speed` then divides. [docker-compose.yml](docker-compose.yml) passes `1.0`; dashboard multipliers of 25× / 200× / 500× land at ~40 ms / ~5 ms / ~2 ms per step |
+| `--helics-broker` | `tcp://localhost:23404` | HELICS broker address |
+| `--helics-core` | `zmq` | HELICS core type |
+| `--delay` | `1.0` | Seconds between steps — the *baseline* pace, which `_control/speed` then divides |
 | `--start-step` | `0` | First step to replay |
 | `--end-step` | last | Last step to replay |
 | `--loop` | off | Restart from `--start-step` instead of terminating |
+
+**`bridge.py`** — the MQTT side:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--host` / `--port` | `localhost` / `1883` | Mosquitto |
+| `--topic` / `-t` | `sim/hdf5/data` | Base topic prefix (also roots `_control/*` and `_meta/run`) |
+| `--qos` | `0` | 0, 1 or 2 — telemetry only; `_meta/run` and setpoint acks are always QoS 1 |
+| `--client-id` | `hdf5_publisher` | MQTT client identifier |
+| `--helics-broker` / `--helics-core` | as above | |
 | `--no-control` | off | Skip the `_control/#` listener entirely |
 
-Every pre-refactor flag kept its name, default and meaning; the four additions are all
-opt-in, so `python hdf5_mqtt_publisher.py -f 20260623_baseline.hdf5` publishes the same
-175 topics with the same payloads in the same order as before.
+**Bridge parity** is the invariant that replaced "the old CLI keeps behaving": for the
+same file and flags, `engine.py` + `bridge.py` publish the same topics with the same
+payloads in the same order as `hdf5_mqtt_publisher.py` did. Verified at the split with a
+5-step capture: 869 telemetry messages, byte-identical, `_meta/run` equal apart from
+`started_at`.
 
-`main()` ([:352-420](hdf5_mqtt_publisher.py#L352-L420)) is a strict pipeline with
-distinct non-zero exit codes for unreadable file, empty dataset set, and broker
-connect failure. `KeyboardInterrupt` is caught for a clean shutdown, and the
-`finally` block always runs `stop_control_listener()` + `loop_stop()` + `disconnect()`
-so the broker sees a graceful DISCONNECT on both connections rather than a keepalive
-timeout.
+`main()` in each is a strict pipeline with distinct non-zero exit codes for unreadable
+file / empty dataset set (engine) and MQTT connect failure (bridge). `KeyboardInterrupt`
+is caught for a clean shutdown, and the `finally` blocks always leave the federation
+(`finalize`) and, in the bridge, `loop_stop()` + `disconnect()` so Mosquitto sees a
+graceful DISCONNECT rather than a keepalive timeout.
+
+---
+
+## 5B. Component 1c — The HELICS federation (`federation.py`, `engine.py`, `bridge.py`, `helics_broker.py`)
+
+### 5B.1 Why a federation now
+
+The HDF5 replay is a stand-in for a real HELICS-based simulation engine. Splitting the
+old publisher into an **engine federate** and a **bridge federate** *before* that engine
+exists means the swap later is one federate speaking an interface that already works,
+not a rewrite of pacing, publishing and the dashboard. The second requirement of the
+split — a genuine two-way loop — is the setpoint path (§5B.4): a value the dashboard
+sends visibly changes what is published next, and the engine acknowledges what it
+actually applied.
+
+```
+HDF5 ──▶ engine.py ◀──HELICS──▶ bridge.py ◀──MQTT──▶ dashboard
+              │                     ▲
+        helics_broker.py      sensor_simulator.py (unchanged) ──MQTT──▶
+```
+
+### 5B.2 The contract: [federation.py](federation.py)
+
+Everything both federates must agree on, in one module a real engine can import or
+transcribe:
+
+| Name | Direction | Payload (JSON string) |
+|---|---|---|
+| `PUB_RUN` = `engine/run` | engine → bridge, once at start | `{"metadata": {…run provenance…}, "catalog": {entity: {variable: attributes}}}` |
+| `PUB_STEP` = `engine/step` | engine → bridge, per step | `{"step": int, "values": {entity: {variable: value}}}` — literally what `ReplayController.steps()` yields |
+| `EP_ENGINE` = `engine/control` | bridge → engine | `{"command": "play" \| "pause"}`, `{"command": "speed", "multiplier"}`, `{"command": "setpoint", "entity", "variable", "value"}` |
+| `EP_BRIDGE` = `bridge/control` | engine → bridge | `{"command": "setpoint_ack", …}` (§5B.4), `{"command": "bye"}` once before leaving |
+| `TIME_DELTA` = 0.05 | both | HELICS seconds per tick; both federates request time in these slices |
+
+One publication carrying the whole step as a blob, not one per variable, is
+deliberate for this pass: it is what let `publish_time_series`'s loop move to the bridge
+unchanged. Per-variable granularity is a decision for when the real engine's own
+interface exists. The run blob also carries the attribute **catalog** because the bridge
+has no `SimulationDataSource` — every `attributes` it puts in a payload came over HELICS.
+`create_federate()` builds a combination federate (values + messages) against
+`--broker_address`; `engine_alive()` is a root `global_status` query the bridge uses as
+a crash safety net; `finalize()` leaves cleanly.
+
+### 5B.3 The clock, and why HELICS time is the engine's wall clock
+
+The plan was "wrap the step loop with `request_time()`". That alone deadlocks on pause:
+the bridge blocks in `helicsFederateRequestTime`, waiting for the engine to advance; a
+paused engine publishes nothing and requests nothing; so the `play` message the bridge
+holds can never be sent. HELICS is not thread-safe and cannot send a message while an
+async request is pending, so a second thread does not help either.
+
+The resolution is the controller's `on_tick` hook ([replay/controller.py](replay/controller.py)):
+`_wait` calls it in every 50 ms slice, *playing or paused*, and the engine's `tick()`
+does `time = request_time(time + TIME_DELTA)` and drains its endpoint. HELICS time
+therefore advances at roughly wall-clock rate regardless of the replay state, the
+bridge is granted every slice, and control flows in both directions at all times. Pacing
+still lives entirely in `ReplayController`; the engine has no `time.sleep`.
+
+The consequence: **HELICS time is the engine's wall clock, not simulation time.**
+Simulation time is `step × dt_seconds`, with `dt_seconds` in `_meta/run`; the telemetry
+payload gained no `sim_time` field, because the wire contract is fixed and the value is
+already derivable. A real engine will most likely make HELICS time the simulation clock;
+the bridge does not care which — it reads whatever arrived at each grant.
+
+Lockstep guarantees no step is lost: the engine can only be granted `t + Δ` once the
+bridge has requested beyond it, and the bridge only requests beyond it after processing
+the value it was granted at `t`. Measured: 4320/4320 steps bridged at `--delay 0.01`.
+The engine sends `bye` and takes one more tick before `finalize`, so the final step is
+always delivered; the bridge exits on `bye`, and — for an engine that died without
+saying so — when `engine_alive()` reports the engine's core `disconnected` (checked every
+5 s; HELICS itself detects lost comms in ~30 s).
+
+### 5B.4 The control seam: `apply_control`
+
+[engine.py](engine.py) — marked in the source as *the seam the real engine's physics
+replaces*. A setpoint is stored in `overrides[(entity, variable)]` and, on every yielded
+step, `apply_overrides` substitutes the commanded value for the recorded one and moves
+one **coupled** variable of the same entity in a way a reader can predict:
+
+| Target variable | Limits (clamped, ack says so) | Coupled effect |
+|---|---|---|
+| `ZoneSetPoint` (°C) | `[10, 30]` | `TBuilding` closes 60 % of the gap to the commanded setpoint |
+| `Qt` (W, heat-pump thermal output) | `[0, 1e5]` | `En_el` scales with `Qt / recorded Qt`; commanding 0 parks the pump |
+| any other `(entity, variable)` in the file | none | value substituted, nothing coupled |
+
+Not physically accurate, and not meant to be — it exists so a dashboard action changes
+a chart line within one step, which it does (verified: `Qt` 47 085 → 0, `En_el` 5 069 →
+0 on the next step; cleared → recorded values return).
+
+Every setpoint produces exactly one **ack**, sent back over `EP_BRIDGE` and republished
+by the bridge, **retained, QoS 1**, to `sim/coesi5/_control/setpoint/<entity>/<variable>/ack`:
+
+```json
+{"entity": "…bui_0027_0", "variable": "ZoneSetPoint", "requested": 99,
+ "applied": 30.0, "accepted": true, "reason": "clamped to [10, 30]", "step": 159,
+ "at": "2026-09-14T18:14:49+00:00"}
+```
+
+`applied` is what the engine holds now (`null` = no override), `accepted: false` with a
+`reason` for an unknown target or a non-finite value. Because it is retained, a late
+subscriber — a reloaded dashboard — learns the true state instantly, which is the only
+thing the setpoint panel ever displays as "applied".
+
+### 5B.5 [helics_broker.py](helics_broker.py)
+
+Runs the broker in-process (`helicsCreateBroker("zmq", …, "-f 2 --port 23404 --external")`)
+rather than the wheel's `helics_broker` binary, for one reason: the compose health check
+can then test something the broker itself asserts. When `helicsBrokerIsConnected()` is
+true the process writes `/tmp/helics-broker.ready`; the health check is that sentinel
+plus a TCP probe of the port. A throwaway federate would be the literal probe, but with
+a fixed `-f 2` it would *join* the federation and break it.
+
+A federation is static: it forms with exactly two members and ends when they leave.
+The broker process outlives federations — when one ends (a bounded `LOOP=0` pass, or a
+crash) it frees the broker and creates a fresh one, so `restart:` policies only ever
+have to bring back the engine and bridge (§11.2).
+
+### 5B.6 Migration path
+
+Replacing the stand-in with the real engine means writing one federate that:
+publishes `engine/run` once and `engine/step` per step in the shapes above, owns an
+endpoint named `engine/control`, answers every `setpoint` with a `setpoint_ack` on
+`bridge/control`, and sends `bye` before leaving. `bridge.py`, `sensor_simulator.py`,
+`docker-compose.yml`'s `bridge`/`sensors`/`frontend` services and the dashboard need no
+change. Open decisions deferred to that moment: per-variable HELICS publications instead
+of one blob, and HELICS time as simulation time (with or without `rt_lag`/`rt_lead`).
 
 ---
 
 ## 5A. Component 1b — The Sensor Simulator (`sensor_simulator.py`)
 
-A **sibling** of the publisher, not a layer on top of it: its own CLI, its own MQTT
+A **sibling** of the engine, not a layer on top of it: its own CLI, its own MQTT
 client, its own pacing loop. It deliberately does *not* use `ReplayController` and does
 not listen on any control topic — sensors are an always-on stream with no
-play/pause/seek/speed semantics, so a researcher can pause the replay to study a moment
+play/pause/speed semantics, so a researcher can pause the replay to study a moment
 while readings keep arriving at their real cadence.
 
 It reads ground truth through `HDF5DataSource`
 ([:761](sensor_simulator.py#L761)), the same `SimulationDataSource`
-contract the publisher uses. That is the whole reason it does not open the HDF5 file
+contract the engine uses. That is the whole reason it does not open the HDF5 file
 itself: moving the project to InfluxDB means changing one construction site here and one
-in `hdf5_mqtt_publisher.py`, and `h5py` stays confined to `datasources/hdf5_source.py`.
+in `engine.py`, and `h5py` stays confined to `datasources/hdf5_source.py`.
 
 ### 5A.1 Two kinds of sensor
 
@@ -807,12 +982,15 @@ sim/coesi5/heating_frassinetto_hp2_proc_0-0.heating_frassinetto_hp2_bui_0027_0/C
 reserved namespaces under the same base topic:
 
 ```
-sim/coesi5/_meta/run           ← publisher → world, retained, QoS 1  (provenance)
-sim/coesi5/_control/play       ← world → publisher                  (transport)
+sim/coesi5/_meta/run                                   ← bridge → world, retained, QoS 1  (provenance)
+sim/coesi5/_control/play                               ← world → bridge → engine         (transport)
 sim/coesi5/_control/pause
-sim/coesi5/_control/seek       payload {"step": 2000}
-sim/coesi5/_control/speed      payload {"multiplier": 2.0}
+sim/coesi5/_control/speed                              payload {"multiplier": 2.0}
+sim/coesi5/_control/setpoint/<entity>/<variable>       payload {"value": 26} — empty or null clears
+sim/coesi5/_control/setpoint/<entity>/<variable>/ack   ← engine → bridge → world, retained, QoS 1
 ```
+
+`_control/seek` no longer exists (§5.6).
 
 The leading underscore is what keeps them out of the data namespace: no HDF5 group is
 named `_meta` or `_control`, and the dashboard filters them by topic before its dataset
@@ -824,9 +1002,12 @@ Driving the replay from a shell:
 
 ```bash
 mosquitto_pub -t sim/coesi5/_control/pause -m ''
-mosquitto_pub -t sim/coesi5/_control/seek  -m '{"step": 2000}'
 mosquitto_pub -t sim/coesi5/_control/speed -m '{"multiplier": 4.0}'
 mosquitto_pub -t sim/coesi5/_control/play  -m ''
+E=heating_frassinetto_hp2_proc_0-0.heating_frassinetto_hp2_bui_0027_0
+mosquitto_pub -t sim/coesi5/_control/setpoint/$E/Qt -m '{"value": 0}'
+mosquitto_sub -t sim/coesi5/_control/setpoint/$E/Qt/ack -C 1 -F '%r %p'   # 1 = retained
+mosquitto_pub -t sim/coesi5/_control/setpoint/$E/Qt -n                     # clear
 ```
 
 Useful subscription filters:
@@ -835,6 +1016,7 @@ Useful subscription filters:
 |---|---|
 | `sim/coesi5/#` | everything, including `_meta` and `_control` (dashboard default) |
 | `sim/coesi5/_meta/run` | run provenance only — arrives immediately, retained |
+| `sim/coesi5/_control/setpoint/#` | every setpoint command and, retained, every last-applied ack |
 | `sim/coesi5/+/COP` | heat-pump COP for every building |
 | `sim/coesi5/time/t` | the clock only |
 | `sim/coesi5/weather0-0.weather_0/#` | all weather channels |
@@ -983,7 +1165,7 @@ deployment is `localhost`-scoped; see §15.
 
 Runs as the `mosquitto` service in [docker-compose.yml](docker-compose.yml): the
 `eclipse-mosquitto:2` image with both ports published, the config bind-mounted read-only
-at `/mosquitto/config/mosquitto.conf`, and a health check that the publisher and sensor
+at `/mosquitto/config/mosquitto.conf`, and a health check that the bridge and sensor
 services wait on (§11.2).
 
 ---
@@ -1124,7 +1306,7 @@ let activeParametersList = new Set();   // "model/variable" pairs seen on real b
 
 // transport state ([:900-903](mqtt_web_tester.html#L900-L903))
 let totalSteps  = 0;           // from payload.total_steps or _meta/run.n_steps
-let isPlaying   = true;        // the publisher starts playing
+let isPlaying   = true;        // the engine starts playing
 let isScrubbing = false;       // true while the slider is held down
 let runMeta     = null;        // last _meta/run payload
 ```
@@ -1201,8 +1383,8 @@ The hot path. Per message, in order:
 3. Push `"<step> | <dataset>: <value>"` onto the front of `logsHistory`, popping past 50
    (bounded ring buffer — the drawer shows the 50 most recent).
 4. `currentStep = step` — **unconditional**, and this is a change the transport forced.
-   The old `max(currentStep, step)` could never move backwards, so after a backward
-   seek the header counter and the scrubber would have frozen at the pre-seek step
+   The old `max(currentStep, step)` could never move backwards, so after a `--loop`
+   wrap the header counter and the progress bar would have frozen at the last step
    while the data underneath changed. `totalSteps` is refreshed from
    `payload.total_steps` on the same line. If the message is `time/t`,
    `currentTime = val`.
@@ -1381,13 +1563,13 @@ as validated for colour-vision-deficiency separation and ≥3:1 contrast against
 
 **History** (`recordChartHistory`, [:1956-1976](mqtt_web_tester.html#L1956-L1976)) —
 `chartHistory[paramKey][building]` is the **authoritative** array of `{step, val}`, held
-sorted by `step` with exactly one entry per step, and never decimated in place. Since
-seek and `--loop` mean messages no longer arrive in increasing step order, the insertion
+sorted by `step` with exactly one entry per step, and never decimated in place. Since a
+`--loop` wrap means messages no longer arrive in increasing step order, the insertion
 point is found by binary search (`historyInsertionPoint`,
 [:1946-1954](mqtt_web_tester.html#L1946-L1954)) — an existing step is overwritten wherever
 it sits, otherwise the point is spliced in at its sorted position. Appending blindly would
-render the polyline in *arrival* order, drawing a crossed-over scribble after any seek or
-loop wrap. Every write bumps a per-series counter in `chartHistoryVersion`.
+render the polyline in *arrival* order, drawing a crossed-over scribble after any loop
+wrap. Every write bumps a per-series counter in `chartHistoryVersion`.
 
 **Decimation** (`compressSeries` via `chartPointsFor`,
 [:1930-1941](mqtt_web_tester.html#L1930-L1941)) — a **render-time view**, computed fresh
@@ -1485,32 +1667,40 @@ controls at that publisher too, with nothing hard-coded.
 `client.send()`s it inside a try/catch. Disconnected clients no-op.
 
 **Speed** (`onSpeedChange`, [:944-947](mqtt_web_tester.html#L944-L947)) — reads the
-`<select>` and publishes `{"multiplier": <value>}`, the same one-liner pattern as
-`seek`'s `{step}`. A native `<select>` rather than a second slider is deliberate: the
+`<select>` and publishes `{"multiplier": <value>}`. A native `<select>` rather than a second slider is deliberate: the
 useful multipliers are a handful of discrete steps spanning three orders of magnitude, a
 range a linear slider handles badly, and it keeps the bar to *icon button + native
 inputs* rather than introducing a third visual idiom. Against the `--delay 1.0`
 baseline, `25×` lands near 40 ms/step and `200×` at 5 ms/step, so the old hardcoded
 `0.009` pace and faster are still reachable — now at runtime instead of at launch. The
-top entry, `500×` (~2 ms/step nominal), is in practice an "as fast as the publisher can
-go" setting rather than a literal pace. Past ~`100×` the publisher, not the multiplier,
+top entry, `500×` (~2 ms/step nominal), is in practice an "as fast as the federation can
+go" setting rather than a literal pace. Past ~`100×` the engine↔bridge lockstep (one
+HELICS grant round-trip per step, ~10 ms measured), not the multiplier,
 is the limit: ~175 `json.dumps` +
 `client.publish` calls per step take a few ms on their own, so the effective rate
 saturates rather than scaling further.
 
-**Scrubber semantics** — `oninput` fires continuously while dragging and only sets
-`isScrubbing = true` plus the local label; `onchange` fires **on release** and is what
-publishes the `seek`. This is the whole reason the two events are split: a seek per
-mouse-move sample would flood the controller with hundreds of jumps per drag. On
-release the handler also sets `currentStep` optimistically so the UI does not snap back
-until the first message from the new position arrives.
+**Scrubber is read-only.** With the HELICS split there is no seek, so the range input
+lost its `oninput`/`onchange` handlers and is `pointer-events: none`; it is a progress
+indicator over `[0, totalSteps - 1]`, still fed by the unchanged telemetry payload.
 
-**Feedback loop** (`updateTransportUI`, [:964-978](mqtt_web_tester.html#L964-L978)) —
-called from `updateUI()` on every throttled repaint. It re-labels the button (`❚❚` /
-`▶`), keeps `scrubber.max` at `totalSteps - 1`, and writes `scrubber.value =
-currentStep` **only when `isScrubbing` is false**, so the incoming stream cannot fight
-the user's thumb mid-drag. The slider therefore tracks the publisher's real position at
-all other times — including a seek issued from `mosquitto_pub` by someone else.
+**Feedback loop** (`updateTransportUI`) — called from `updateUI()` on every repaint. It
+re-labels the button (`❚❚` / `▶`), keeps `scrubber.max` at `totalSteps - 1`, and writes
+`scrubber.value = currentStep`, so the slider tracks the engine's real position.
+
+**Setpoint panel** (Live Chart sidebar; `renderSetpointPanel`, `applySetpoint`,
+`clearSetpoint`) — a building select, a target select (`building/ZoneSetPoint`,
+`heating/Qt`), a number input, Apply and Clear. It needs the engine's *full* entity name,
+which the dashboard's `building`/`model` keys have shortened away, so `onMessageArrived`
+records `entityPathFor[building][model]` from each payload's `dataset`. Apply publishes
+`{"value": n}` (QoS 1) to `_control/setpoint/<entity>/<variable>`; Clear publishes
+`{"value": null}`. The panel's status line shows *only* the retained ack for the selected
+target — applied value and step, "clamped", "rejected: …", or "no override" — and lists
+every active override from every ack received. Because acks are retained, a reloaded
+page shows the true state before a single telemetry message has arrived. Acks are
+routed in `onMessageArrived` *before* the `_control/` bail-out, which otherwise drops
+control traffic.
+
 
 **Provenance** (`applyRunMetadata`, [:981-991](mqtt_web_tester.html#L981-L991)) — stores
 the payload, adopts `n_steps` as `totalSteps` (which is what lets the scrubber be
@@ -1676,6 +1866,8 @@ A headless verification tool for confirming the stream is healthy without openin
 ## 11. Container & orchestration layer
 
 One image, one compose file, one script. `./run.sh up` is the whole startup procedure.
+Six services: two brokers (Mosquitto, HELICS), two federates (engine, bridge), the
+sensor simulator and the dashboard server.
 
 ### 11.1 [Dockerfile](Dockerfile)
 
@@ -1684,12 +1876,12 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY hdf5_mqtt_publisher.py sensor_simulator.py mqtt_tester.py ./
+COPY engine.py bridge.py federation.py helics_broker.py sensor_simulator.py mqtt_tester.py ./
 COPY datasources/ ./datasources/
 COPY replay/ ./replay/
 COPY 20260623_baseline.hdf5 ./
-ENTRYPOINT ["python3", "hdf5_mqtt_publisher.py"]
-CMD ["--file", "20260623_baseline.hdf5", "--host", "mosquitto", "--port", "1883", "--topic", "sim/coesi5", "--delay", "1.0", "--loop"]
+ENTRYPOINT ["python3", "engine.py"]
+CMD ["--file", "20260623_baseline.hdf5", "--helics-broker", "tcp://helics-broker:23404", "--delay", "1.0", "--loop"]
 ```
 
 Dependencies come from [requirements.txt](requirements.txt), pinned to the versions the
@@ -1698,35 +1890,45 @@ two package `COPY` lines are load-bearing: the entrypoint script imports `dataso
 and `replay`, so omitting them fails the container at import time rather than at replay
 time.
 
-The **ENTRYPOINT/CMD split** is what lets one image serve two roles: the entrypoint
+The **ENTRYPOINT/CMD split** is what lets one image serve four roles: the entrypoint
 fixes the program and CMD supplies default arguments that compose replaces wholesale.
-The `sensors` service overrides the entrypoint to `sensor_simulator.py`.
+The `bridge`, `helics-broker` and `sensors` services override the entrypoint to their
+own scripts.
 
 The data file is baked into the image (`COPY … .hdf5`), making the container
 self-contained at the cost of a ~10 MB layer that invalidates whenever the simulation
-is re-run. The default `--host mosquitto` is the compose service name — containers talk
-to the broker over the compose network, not via host networking, so the stack behaves
-the same on macOS, Linux and Windows.
+is re-run. `helics-broker` / `mosquitto` in the defaults are compose service names —
+containers talk to the brokers over the compose network, not via host networking, so
+the stack behaves the same on macOS, Linux and Windows.
 
 ### 11.2 [docker-compose.yml](docker-compose.yml)
 
 | service | image | role |
 |---|---|---|
-| `mosquitto` | `eclipse-mosquitto:2` | Broker. Publishes 1883 (TCP) and 9001 (WebSockets); `mosquitto.conf` bind-mounted. **Health-checked** with a `mosquitto_sub -t '$SYS/#' -C 1` probe every 2 s. |
-| `publisher` | built from `Dockerfile` | The replay. `depends_on: mosquitto: condition: service_healthy`, so it is not started until the broker actually accepts a connection — the ordering the old `nc -z` preflight raced to approximate. |
-| `sensors` | same image, entrypoint `sensor_simulator.py` | The synthetic sensor stream. Same health dependency; also `depends_on: publisher` so the shared image is built exactly once. |
+| `mosquitto` | `eclipse-mosquitto:2` | MQTT broker. Publishes 1883 (TCP) and 9001 (WebSockets); `mosquitto.conf` bind-mounted. **Health-checked** with a `mosquitto_sub -t '$SYS/#' -C 1` probe every 2 s. |
+| `helics-broker` | built from `Dockerfile`, entrypoint `helics_broker.py` | HELICS broker for exactly two federates. **Health-checked** on its own readiness sentinel plus a TCP probe of 23404 (§5B.5). Not published to the host. |
+| `engine` | same image (default entrypoint) | The engine federate. `depends_on: helics-broker: service_healthy`. |
+| `bridge` | same image, entrypoint `bridge.py` | The bridge federate. Waits for **both** brokers to be healthy. |
+| `sensors` | same image, entrypoint `sensor_simulator.py` | The synthetic sensor stream. Waits for Mosquitto; also `depends_on: helics-broker: service_started` so the shared image is built exactly once. |
 | `frontend` | stock `python:3.11-slim` | `local_server.py` with the HTML bind-mounted read-only; port mapped to `127.0.0.1:8002` only (§8.3). |
 
-All four carry `restart: unless-stopped`, so the stack survives a Docker restart and a
-reboot — the old broker container, started without a restart policy, did not.
+**Restart policies encode the federation's lifecycle.** `mosquitto`, `helics-broker`,
+`sensors` and `frontend` are `unless-stopped`: they survive a Docker restart and a
+reboot. `engine` and `bridge` are `on-failure`: a bounded `LOOP=0` pass that finishes
+cleanly (exit 0 on both, after `bye`) stays finished instead of being restarted into
+another pass; a crash of either is non-zero, the survivor notices (HELICS lost-comms,
+~30 s; the bridge's `engine_alive()` check) and exits non-zero too, `helics_broker.py`
+recycles its broker, and Docker restarts both federates into a fresh federation.
+Verified for the bridge/broker side by killing the engine; the engine's own restart on a
+real crash is Docker's `on-failure` contract. `./run.sh restart` is the manual version.
 
 **Looping is the default and is the fix for a real bug, not a convenience.** Run the
-publisher without `--loop` and the replay simply *ends*: the generator exhausts,
-`main()`'s `finally` tears down both MQTT connections, the container exits. Because
-telemetry is QoS 0 and unretained, there is then nothing left for a dashboard to receive
-and nothing listening on `_control/#` either — the stream looks "broken" when it has
-actually finished. The same applies to the sensor stream. `LOOP=0` gives the bounded
-one-shot pass for a finite, reproducible run.
+engine without `--loop` and the replay simply *ends*: the generator exhausts, the engine
+says `bye` and leaves, the bridge exits, the federation dissolves. Because telemetry is
+QoS 0 and unretained, there is then nothing left for a dashboard to receive and nothing
+listening on `_control/#` either — the stream looks "broken" when it has actually
+finished. The same applies to the sensor stream. `LOOP=0` gives the bounded one-shot
+pass for a finite, reproducible run.
 
 The compose file reads its flags from four environment variables with defaults —
 `${LOOP_FLAG---loop}`, `${SENSOR_LOOP_FLAG---loop}`, `${SEED_FLAG-}`, `${DELAY:-1.0}` —
@@ -1759,15 +1961,18 @@ DELAY=0.5 ./run.sh up      # baseline pace
 `SENSOR_LOOP_FLAG=--no-loop` (the two CLIs spell "don't loop" differently); `SEED=n` →
 `SEED_FLAG="--seed n"`.
 
-`dev` exists because the two Python processes are what changes while iterating and the
-broker never does: it starts only `mosquitto` and `frontend` in Docker, then runs the
-publisher and sensor simulator in the foreground from `.venv` at `--delay 0.3`, both
-killed by one Ctrl+C. Edit → Ctrl+C → re-run, no image rebuild.
+`dev` exists because the federation is what changes while iterating and Mosquitto never
+does: it starts `mosquitto`, `sensors` and `frontend` in Docker, stops the Docker
+federation, then runs `helics_broker.py`, `bridge.py` and `engine.py` (at `--delay 0.3`)
+in the foreground from `.venv`, all killed by one Ctrl+C. The HELICS broker runs
+host-side too, not in Docker: a ZMQ core needs the broker to connect *back* to each
+federate's receive socket, which a broker inside Docker Desktop's VM cannot reliably do
+to processes on the Mac. Edit → Ctrl+C → re-run, no image rebuild.
 
 ### 11.4 Startup order
 
-There is no longer an order to get right: compose starts the broker, waits for its
-health check, and then starts the publisher, sensors and frontend.
+There is no longer an order to get right: compose starts both brokers, waits for
+their health checks, and then starts the engine, bridge, sensors and frontend.
 
 ```bash
 ./run.sh up
@@ -1785,7 +1990,8 @@ from a session without touching anything else.
 ```mermaid
 sequenceDiagram
     participant H as HDF5 file
-    participant P as Publisher
+    participant E as Engine
+    participant P as Bridge
     participant B as Mosquitto
     participant S as local_server
     participant D as Dashboard
@@ -1807,7 +2013,9 @@ sequenceDiagram
     B-->>D: retained _meta/run → badge + scrubber bounds
 
     loop every step (controller.steps(), delay/speed)
-        P->>P: controller: check paused / seek / speed
+        E->>E: on_tick: request_time(t+Δ), drain EP_ENGINE
+        E->>E: controller.steps() yields; apply_overrides
+        E->>P: HELICS engine/step {step, values}
         P->>P: source.read_step(step); latch zero-filter
         P->>B: PUBLISH × ~175 topics (QoS 0)
         B-->>D: deliver ~175 JSON messages
@@ -1815,10 +2023,14 @@ sequenceDiagram
         D->>D: requestAnimationFrame → updateUI() once per burst<br/>(table + map + chart + transport bar)
     end
 
-    Note over D: user drags the scrubber and releases
-    D->>B: PUBLISH sim/coesi5/_control/seek {"step": 2000}
-    B-->>P: control client → controller.seek(2000)
-    P->>P: next loop top: step := 2000
+    Note over D: user applies a setpoint in the Live Chart sidebar
+    D->>B: PUBLISH sim/coesi5/_control/setpoint/<entity>/Qt {"value": 0}
+    B-->>P: _on_control_message → queue
+    P->>E: HELICS EP_ENGINE {"command": "setpoint", …}
+    E->>E: validate, clamp, store override
+    E->>P: HELICS EP_BRIDGE {"command": "setpoint_ack", applied: 0.0, …}
+    P->>B: PUBLISH …/Qt/ack (retained, QoS 1)
+    B-->>D: ack → setpoint panel shows "applied 0 at step n"
 
     Note over D: user clicks "Load Map"
     D->>S: GET /proxy/<encoded UrbanSim URL>
@@ -1867,12 +2079,15 @@ a `structureChanged` / `paramsChanged` flag.
 | Failure | Detection | Behaviour |
 |---|---|---|
 | Broker not ready at publish time | compose `depends_on: condition: service_healthy` (`mosquitto_sub $SYS` probe) | Publisher and sensors are not started until the broker accepts connections |
-| Broker unreachable from publisher | 10 s connect barrier | `RuntimeError` → exit code 1 |
+| Mosquitto unreachable from bridge | 10 s connect barrier | `RuntimeError` → exit code 1; compose restarts (`on-failure`) |
+| HELICS broker unreachable / federation full | `helicsCreateCombinationFederate` raises | Traceback, exit 1; compose restarts with backoff until the broker has recycled |
+| Engine or bridge crashes mid-run | HELICS lost-comms (~30 s); bridge `engine_alive()` every 5 s | Survivor exits non-zero; broker recycles; both federates restart into a fresh federation |
+| Bounded run finishes | engine sends `bye`, leaves | Bridge exits 0; both stay down (`on-failure`); broker recycles and waits |
 | HDF5 file unreadable | `OSError` around `HDF5DataSource(...)` | Logged, exit code 1 |
 | No 1-D datasets found | `get_step_count() <= 0` | Logged, exit code 1 |
-| Control listener cannot subscribe | 10 s subscribe barrier | Warning logged; replay continues **uncontrollable** |
+| Setpoint for unknown entity/variable, or non-finite value | Engine validates against `get_entities()` | Retained ack with `accepted: false` + reason; nothing applied |
+| Setpoint outside `SETPOINT_LIMITS` | Engine clamps | Applied at the bound; ack says `clamped to [lo, hi]` |
 | Malformed `_control/*` payload | `json.JSONDecodeError` → `{}`; missing field check | Warning logged; command ignored, replay unaffected |
-| `seek` beyond the replay window | Clamped to `[start_step, end_step]` | Jumps to the nearest valid step |
 | `speed` multiplier ≤ 0 | Explicit guard in `set_speed` | Warning logged; multiplier unchanged (no div-by-zero) |
 | `NaN` / `Inf` in data | `allow_nan=False` | `ValueError` raised — loud, not silent |
 | Unexpected broker disconnect | `_on_disconnect` reason code ≠ 0 | Warning logged; Paho's loop retries |
@@ -1954,12 +2169,12 @@ progressively. Publishing each topic's latest value with `retain=True` would giv
 subscriber an instant full snapshot — at the cost of 175 retained messages the broker
 must hold and re-deliver.
 
-**Control has no acknowledgement.** `_control/*` is fire-and-forget: the publisher never
+**Transport control has no acknowledgement** (setpoints do — §5B.4). `_control/play|pause|speed` are fire-and-forget: the engine never
 echoes its state back, so the dashboard's `isPlaying` and its speed selector are local
 optimistic guesses. Two browsers driving the same replay can disagree about whether it
 is paused or how fast it is running — unlike `Step:`, which self-corrects from the
 telemetry, the selector never learns that someone else changed the multiplier. A `pause`
-sent while the publisher is down is likewise silently lost. A retained `_meta/state`
+sent while the engine is down is likewise silently lost. A retained `_meta/state`
 published on every transition would make the transport authoritative.
 
 **Looping overwrites the chart in place.** `recordChartHistory` keeps each series sorted
@@ -1969,16 +2184,35 @@ sawtooth. That is the intended behaviour, but it means the chart cannot show *wh
 pass a point came from; the run's `started_at` in `_meta/run` is the only pass-level
 provenance. Clear History resets the chart if a clean pass is wanted.
 
-**Zero-filter latching interacts with seeking.** The `has_been_nonzero` set is built
-only from steps that were actually published. Seek past a variable's activation step and
-that variable stays suppressed until it is next non-zero at a *visited* step — the
-dashboard will simply not know it exists. Pre-scanning each dataset for its first
-non-zero index would make the latch seek-independent.
+**Zero-filter latching depends on visited steps.** The `has_been_nonzero` set is built
+only from steps that were actually published. Start past a variable's activation step
+(`--start-step`) and that variable stays suppressed until it is next non-zero at a
+*visited* step — the dashboard will simply not know it exists. Pre-scanning each dataset
+for its first non-zero index would make the latch independent of the replay window.
+
+**Seek was removed with the HELICS split.** A federation's clock cannot run backwards,
+so the scrubber is now a read-only progress bar. This is a regression against the
+project's first priority (pause, *scrub*, re-watch), taken deliberately: emulating seek
+by restarting the federation, or by a checkpoint/restore mechanism, is out of scope for
+this pass and should be designed with the real engine, not the stand-in.
+
+**The federation is static and restarts as a unit.** Exactly two federates, no late
+joining. A crash of the engine or bridge takes the other down after HELICS's ~30 s
+lost-comms detection (the bridge's `engine_alive()` check is faster only when the broker
+already knows), and compose restarts both. During those seconds the dashboard sees a
+frozen `Step:`; the retained `_meta/run` and setpoint acks survive on Mosquitto, but the
+engine's *overrides* do not — after a restart every setpoint is cleared while its last
+ack still says "applied". Re-applying from the dashboard re-syncs them; publishing a
+fresh set of acks at engine start would close the gap.
+
+**HELICS time is the wall clock.** §5B.3. Fine for the stand-in; the real engine should
+make HELICS time the simulation clock, at which point the `on_tick` pattern needs
+rethinking against `rt_lag`/`rt_lead`.
 
 **Control commands are unauthenticated.** `allow_anonymous true` means anyone who can
-reach port 1883 or 9001 can pause or seek a running replay. Acceptable on a trusted
-local machine, and no worse than the existing exposure — but it is now a *write* path,
-not just a read path.
+reach port 1883 or 9001 can pause a running replay or push a setpoint into the engine.
+Acceptable on a trusted local machine, and no worse than the existing exposure — but it
+is a *write* path into the simulation, not just a read path.
 
 **Whole-file eager load.** `ds[()]` on every dataset means peak RSS scales with file
 size. At 10 MB this is free; at multi-GB simulation outputs it would require chunked
@@ -2030,6 +2264,14 @@ bounded queue filled by a background thread is a change local to
 **Add retained-message snapshots.** Publishing the latest value of each topic with the
 retain flag would let a dashboard connecting mid-run receive an immediate full snapshot
 instead of filling in progressively — `_meta/run` already proves the pattern.
+
+**Swap in the real engine.** §5B.6 — one federate honouring `federation.py`; nothing
+else changes. Per-variable publications and HELICS-time-as-simulation-time are the two
+decisions to take then.
+
+**Re-announce overrides at engine start.** Publish a `setpoint_ack` per known override
+(or an explicit "all cleared") on entering the federation, so a restarted engine's
+retained acks never disagree with its actual state (§15).
 
 **Make the transport authoritative.** Publish a retained `sim/coesi5/_meta/state`
 (`{playing, step, speed}`) on every transition, and have the dashboard render *that*

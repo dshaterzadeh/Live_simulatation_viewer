@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # One entry point for the whole prototype.
 #
-#   ./run.sh up        build if needed, start broker + publisher + sensors + frontend
-#   ./run.sh down      stop and remove all four containers
+#   ./run.sh up        build if needed, start brokers + engine + bridge + sensors + frontend
+#   ./run.sh down      stop and remove all six containers
 #   ./run.sh restart   down + up
 #   ./run.sh status    container states and the URLs to open
-#   ./run.sh logs [service]   follow logs (default: publisher)
-#   ./run.sh dev       host-side publisher + sensors from .venv against the
-#                      Docker broker, for fast iteration without rebuilding
+#   ./run.sh logs [service]   follow logs (default: engine)
+#   ./run.sh dev       host-side HELICS broker + engine + bridge from .venv against
+#                      the Docker Mosquitto, for fast iteration without rebuilding
 #
 # Knobs, all optional:  DELAY=1.0  LOOP=1  SEED=42  SENSOR_DELAY=1.0
 #   LOOP=0 ./run.sh up        single bounded pass instead of looping forever
@@ -28,7 +28,7 @@ need_docker() {
   fi
 }
 
-# Translate LOOP / SEED into the flags the two Python CLIs take. The publisher
+# Translate LOOP / SEED into the flags the two Python CLIs take. The engine
 # only has --loop (absence = one pass); the simulator has --loop/--no-loop.
 export_flags() {
   if [ "${LOOP:-1}" = "0" ]; then
@@ -59,16 +59,21 @@ cmd_status() {
   echo
   echo "Dashboard : $PAGE  → click Connect"
   echo "Replay    : ${LOOP:-1} loop, DELAY=${DELAY:-1.0}s/step (speed is live from the dashboard)"
-  echo "Logs      : ./run.sh logs [publisher|sensors|mosquitto|frontend]"
+  echo "Logs      : ./run.sh logs [engine|bridge|helics-broker|sensors|mosquitto|frontend]"
 }
 
 cmd_logs() {
   need_docker
-  docker compose logs -f --tail=50 "${1:-publisher}"
+  docker compose logs -f --tail=50 "${1:-engine}"
 }
 
-# Host-side iteration: the broker stays in Docker (it never changes), the two
-# Python processes run from .venv so an edit is a Ctrl+C and a re-run away.
+# Host-side iteration: Mosquitto, sensors and the frontend stay in Docker (they
+# never change while working on the federation); the HELICS broker, engine and
+# bridge run from .venv so an edit is a Ctrl+C and a re-run away.
+#
+# The HELICS broker runs host-side too, not in Docker: a ZMQ core needs the
+# broker to connect *back* to each federate, and a broker inside Docker
+# Desktop's VM cannot reliably reach processes on the Mac. It is one line.
 cmd_dev() {
   need_docker
   if [ ! -x .venv/bin/python ]; then
@@ -76,14 +81,15 @@ cmd_dev() {
     exit 1
   fi
   export_flags
-  docker compose up -d mosquitto frontend
-  echo "Broker + frontend up. Starting publisher and sensors from .venv (Ctrl+C stops both)…"
+  docker compose up -d mosquitto frontend sensors
+  docker compose stop engine bridge helics-broker >/dev/null 2>&1 || true
+  echo "Mosquitto + sensors + frontend up. Starting HELICS broker, bridge and engine from .venv (Ctrl+C stops all)…"
   trap 'kill 0' EXIT INT TERM
+  .venv/bin/python helics_broker.py --federates 2 --port 23404 &
+  sleep 1
+  .venv/bin/python bridge.py -t sim/coesi5 --helics-broker tcp://127.0.0.1:23404 &
   # shellcheck disable=SC2086
-  .venv/bin/python sensor_simulator.py -f 20260623_baseline.hdf5 -t sensors \
-      --delay "${SENSOR_DELAY:-0.3}" $SENSOR_LOOP_FLAG $SEED_FLAG &
-  # shellcheck disable=SC2086
-  .venv/bin/python hdf5_mqtt_publisher.py -f 20260623_baseline.hdf5 -t sim/coesi5 \
+  .venv/bin/python engine.py -f 20260623_baseline.hdf5 --helics-broker tcp://127.0.0.1:23404 \
       --delay "${DELAY:-0.3}" $LOOP_FLAG
 }
 

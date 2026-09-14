@@ -1,48 +1,85 @@
-# The whole prototype in one stack: broker, replay publisher, sensor simulator,
-# and the static/proxy server for the dashboard. Driven by ./run.sh.
+# The whole prototype in one stack: two brokers, the HELICS engine + bridge
+# federates, the sensor simulator, and the static/proxy server for the
+# dashboard. Driven by ./run.sh.
 #
 # Knobs (environment variables, all optional):
-#   DELAY=1.0   baseline seconds per step for the publisher (the dashboard's speed
+#   DELAY=1.0   baseline seconds per step for the engine (the dashboard's speed
 #               selector divides this at runtime — do not bake a fast delay in here)
 #   LOOP=1      1 = replay/sensors loop forever (default), 0 = single bounded pass
 #   SEED=       integer seed for reproducible sensor noise and faults (unset = random)
 #   SENSOR_DELAY=1.0  baseline pace of the sensor simulator, independent of DELAY
+#
+# The HELICS federation (engine + bridge) is static: it forms with exactly two
+# federates and cannot be joined late. helics-broker outlives federations — it
+# recycles itself when one ends. engine and bridge restart `on-failure` only:
+# a bounded LOOP=0 pass that finishes cleanly stays finished, while a crash of
+# either makes the other exit too (HELICS lost-comms, ~30 s) and both restart.
 
 services:
   mosquitto:
     image: eclipse-mosquitto:2
     container_name: mosquitto-broker
     ports:
-      - "1883:1883"   # MQTT over TCP  — publisher, sensors, mosquitto_pub/sub
+      - "1883:1883"   # MQTT over TCP  — bridge, sensors, mosquitto_pub/sub
       - "9001:9001"   # MQTT over WebSockets — the browser dashboard
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     healthcheck:
-      # The publisher and sensors only start once the broker actually accepts
-      # connections, which is what the old `nc -z 1883` race was trying to do.
+      # The bridge and sensors only start once the broker actually accepts
+      # connections.
       test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883", "-t", "$$SYS/#", "-C", "1", "-W", "2"]
       interval: 2s
       timeout: 3s
       retries: 15
     restart: unless-stopped
 
-  publisher:
+  helics-broker:
     build: .
     image: hdf5-publisher
-    container_name: hdf5-publisher
+    container_name: helics-broker
+    entrypoint: ["python3", "helics_broker.py"]
+    command: ["--federates", "2", "--port", "23404"]
+    healthcheck:
+      # The broker writes the sentinel from its own helicsBrokerIsConnected();
+      # the socket probe confirms the port is really accepting. A throwaway
+      # federate would be the literal test, but with a fixed federate count it
+      # would join — and break — the real federation.
+      test: ["CMD", "python3", "-c", "import os,socket,sys; sys.exit(0 if os.path.exists('/tmp/helics-broker.ready') and socket.create_connection(('127.0.0.1', 23404), timeout=1) else 1)"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  engine:
+    image: hdf5-publisher
+    container_name: hdf5-engine
     depends_on:
-      mosquitto:
+      helics-broker:
         condition: service_healthy
-    # Looping is the point: telemetry is QoS 0 and unretained, so a publisher that
-    # exits after one pass leaves the dashboard with nothing arriving and nothing
-    # listening on _control/#. LOOP=0 gives a bounded one-shot run instead.
+    # Looping is the point: telemetry is QoS 0 and unretained, so an engine that
+    # exits after one pass leaves the dashboard with nothing arriving. LOOP=0
+    # gives a bounded one-shot run instead (the whole federation then exits).
     command: >
       --file 20260623_baseline.hdf5
-      --host mosquitto --port 1883
-      --topic sim/coesi5
+      --helics-broker tcp://helics-broker:23404
       --delay ${DELAY:-1.0}
       ${LOOP_FLAG---loop}
-    restart: unless-stopped
+    restart: on-failure
+
+  bridge:
+    image: hdf5-publisher
+    container_name: hdf5-bridge
+    depends_on:
+      helics-broker:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    entrypoint: ["python3", "bridge.py"]
+    command: >
+      --host mosquitto --port 1883
+      --topic sim/coesi5
+      --helics-broker tcp://helics-broker:23404
+    restart: on-failure
 
   sensors:
     image: hdf5-publisher
@@ -50,7 +87,7 @@ services:
     depends_on:
       mosquitto:
         condition: service_healthy
-      publisher:
+      helics-broker:
         condition: service_started   # shares the image; ensures it has been built
     entrypoint: ["python3", "sensor_simulator.py"]
     command: >
