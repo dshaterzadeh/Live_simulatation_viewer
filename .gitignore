@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime artefacts from the old host-side scripts and from ./run.sh dev
+*.log
+*.pid
+
+# macOS
+.DS_Store

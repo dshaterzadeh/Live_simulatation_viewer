@@ -1,0 +1,6 @@
+# Runtime dependencies. Pinned to what .venv/ was built with; the Dockerfile
+# installs from this file so the container and the host run the same versions.
+h5py==3.16.0
+numpy==2.2.6
+paho-mqtt==2.1.0
+rich==15.0.0

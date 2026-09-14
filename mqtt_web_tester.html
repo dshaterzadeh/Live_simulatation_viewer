@@ -1,0 +1,2432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HDF5 Heatmap Dashboard</title>
+    <!-- Paho MQTT -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.2/mqttws31.min.js"></script>
+    
+    <!-- MapLibre & Deck.GL -->
+    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <script src="https://unpkg.com/deck.gl@8.9.33/dist.min.js"></script>
+
+    <style>
+        :root {
+            --bg-dark: #0f172a;
+            --bg-panel: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #3b82f6;
+            --border: #334155;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, sans-serif;
+            margin: 0;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .top-bar {
+            padding: 8px 12px;
+            background: var(--bg-panel);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-shrink: 0;
+            z-index: 1000;
+        }
+        .top-bar input {
+            padding: 5px 8px;
+            font-size: 0.8rem;
+        }
+        .top-bar button {
+            padding: 6px 12px;
+            font-size: 0.8rem;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-right: 10px;
+        }
+        .tab-btn {
+            background: transparent;
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 0.8rem;
+            white-space: nowrap;
+        }
+        .tab-btn.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        input, select {
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            outline: none;
+        }
+
+        button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+        button:hover { background: #2563eb; }
+        button.danger { background: #ef4444; }
+        button.danger:hover { background: #dc2626; }
+        button.secondary { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
+        button.secondary:hover { background: rgba(59, 130, 246, 0.1); }
+
+        .global-stats {
+            display: flex;
+            gap: 12px;
+            color: #10b981;
+            font-weight: bold;
+            font-family: monospace;
+            font-size: 0.85rem;
+            margin-left: 8px;
+            white-space: nowrap;
+        }
+
+        /* Transport bar (play/pause + scrubber) */
+        .transport {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-left: 8px;
+            white-space: nowrap;
+        }
+        .transport button {
+            width: 34px;
+            padding: 6px 0;
+            text-align: center;
+            font-family: monospace;
+        }
+        .transport button:disabled {
+            background: var(--border);
+            color: var(--text-muted);
+            cursor: not-allowed;
+        }
+        .transport input[type=range] {
+            width: 190px;
+            padding: 0;
+            accent-color: var(--primary);
+            background: transparent;
+            border: none;
+            cursor: pointer;
+        }
+        .transport input[type=range]:disabled { cursor: not-allowed; opacity: 0.5; }
+        .transport select {
+            padding: 5px 6px;
+            font-size: 0.78rem;
+            font-family: monospace;
+            cursor: pointer;
+        }
+        .transport select:disabled { cursor: not-allowed; opacity: 0.5; }
+        .transport .scrub-label {
+            font-family: monospace;
+            font-size: 0.78rem;
+            color: var(--text-muted);
+            min-width: 92px;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-left: auto;
+            font-size: 0.8rem;
+            white-space: nowrap;
+            position: relative;
+        }
+        .meta-badge {
+            font-family: monospace;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 4px 8px;
+            cursor: default;
+            max-width: 230px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .meta-badge:hover { border-color: var(--primary); color: var(--text-main); }
+        .meta-popover {
+            display: none;
+            position: absolute;
+            top: 30px;
+            right: 0;
+            z-index: 2000;
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 12px;
+            font-family: monospace;
+            font-size: 0.75rem;
+            line-height: 1.5;
+            color: var(--text-main);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            white-space: pre;
+            text-align: left;
+        }
+        .meta-badge:hover + .meta-popover, .meta-popover:hover { display: block; }
+        /* Connection config drop-down. Click-toggled, not hover like .meta-popover:
+           it holds inputs the user has to travel into and type in. */
+        .config { position: relative; flex-shrink: 0; }
+        .config button { white-space: nowrap; }
+        .config-popover {
+            display: none;
+            position: absolute;
+            top: 32px;
+            left: 0;
+            z-index: 2000;
+            background: var(--bg-panel);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 12px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+            text-align: left;
+            width: 190px;
+        }
+        .config-popover.open { display: block; }
+        .config-popover label {
+            display: block;
+            font-size: 0.7rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            color: var(--text-muted);
+            margin-bottom: 3px;
+        }
+        .config-popover input {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;   /* padding must not push the input past the panel */
+            margin-bottom: 8px;
+            font-size: 0.8rem;
+            padding: 5px 8px;
+        }
+        .config-popover input:last-child { margin-bottom: 0; }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ef4444;
+        }
+        .status-dot.connected {
+            background: #10b981;
+            box-shadow: 0 0 8px #10b981;
+        }
+
+        /* Tabs Content */
+        .tab-content {
+            display: none;
+            flex-grow: 1;
+            overflow: auto;
+            position: relative;
+        }
+        .tab-content.active {
+            display: block;
+        }
+
+        /* Heatmap Grid */
+        .table-container {
+            padding: 20px;
+        }
+        .table-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            width: fit-content;
+            position: sticky;
+            left: 20px;
+            margin-bottom: 12px;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        table {
+            border-collapse: collapse;
+            width: max-content;
+            font-size: 0.85rem;
+        }
+
+        th, td {
+            border: 1px solid var(--border);
+            text-align: center;
+            padding: 8px;
+            min-width: 80px;
+        }
+
+        th {
+            background: var(--bg-panel);
+            color: var(--text-muted);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        
+        .th-model {
+            background: #273950;
+            color: #e2e8f0;
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            top: 0;
+            z-index: 20;
+        }
+        
+        .th-var {
+            top: 33px; /* height of model row */
+            font-size: 0.75rem;
+            font-family: monospace;
+        }
+        
+        .td-bui {
+            position: sticky;
+            left: 0;
+            background: var(--bg-panel);
+            font-weight: bold;
+            z-index: 5;
+            text-align: left;
+            padding: 0 15px;
+        }
+
+        .val-cell {
+            font-family: monospace;
+            color: white;
+            text-shadow: 0 0 2px black;
+            transition: background-color 0.3s;
+        }
+
+        /* Map UI */
+        #map-container {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+        }
+        .map-overlay {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: rgba(30, 41, 59, 0.9);
+            padding: 15px;
+            border-radius: 8px;
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            border: 1px solid var(--border);
+        }
+
+        /* DeckGL Tooltip override */
+        .deck-tooltip {
+            background: rgba(15, 23, 42, 0.9) !important;
+            color: white !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 4px !important;
+            font-family: monospace !important;
+            padding: 10px !important;
+            white-space: pre-wrap !important;
+        }
+
+        /* Hidden Logs Panel */
+        .logs-panel {
+            position: fixed;
+            top: 0;
+            right: -400px;
+            width: 400px;
+            height: 100vh;
+            background: var(--bg-panel);
+            border-left: 1px solid var(--border);
+            transition: right 0.3s ease;
+            display: flex;
+            flex-direction: column;
+            z-index: 2000;
+            box-shadow: -5px 0 15px rgba(0,0,0,0.5);
+        }
+        .logs-panel.open {
+            right: 0;
+        }
+        .logs-header {
+            padding: 15px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-weight: bold;
+        }
+        .logs-content {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 15px;
+            font-family: monospace;
+            font-size: 0.8rem;
+            color: #a7f3d0;
+        }
+        .log-entry {
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            padding: 4px 0;
+            word-break: break-all;
+        }
+
+        /* Live Chart + Sensors tabs — same shell, same chart machinery */
+        #tab-chart.active, #tab-sensors.active {
+            display: flex;
+            overflow: hidden;
+        }
+        .chart-sidebar {
+            width: 260px;
+            flex-shrink: 0;
+            background: var(--bg-panel);
+            border-right: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            padding: 12px;
+            gap: 10px;
+            overflow: hidden;
+        }
+        .chart-sidebar label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .chart-sidebar input, .chart-sidebar select {
+            width: 100%;
+            box-sizing: border-box;
+            font-size: 0.85rem;
+        }
+        .building-list {
+            flex-grow: 1;
+            overflow-y: auto;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg-dark);
+            min-height: 80px;
+        }
+        .building-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            user-select: none;
+        }
+        .building-item:hover { background: rgba(59, 130, 246, 0.1); }
+        .building-item.selected { background: rgba(59, 130, 246, 0.15); }
+        .building-item.disabled { opacity: 0.4; cursor: not-allowed; }
+        .bui-swatch {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            border: 1px solid var(--border);
+            background: transparent;
+        }
+        .chart-main {
+            flex-grow: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            padding: 12px 16px;
+        }
+        .chart-header {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 4px 0 10px 0;
+        }
+        .chart-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px 18px;
+            min-height: 22px;
+            flex-grow: 1;
+        }
+        .range-toggle {
+            display: flex;
+            flex-shrink: 0;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            overflow: hidden;
+        }
+        .range-btn {
+            background: transparent;
+            color: var(--text-muted);
+            border: none;
+            border-radius: 0;
+            padding: 4px 10px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        .range-btn + .range-btn { border-left: 1px solid var(--border); }
+        .range-btn.active {
+            background: var(--primary);
+            color: white;
+        }
+        .range-btn:hover:not(.active) { background: rgba(59, 130, 246, 0.1); }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            font-size: 0.82rem;
+            color: var(--text-main);
+        }
+        .legend-key {
+            width: 14px;
+            height: 3px;
+            border-radius: 2px;
+            flex-shrink: 0;
+        }
+        .legend-val {
+            font-family: monospace;
+            color: var(--text-muted);
+        }
+        .chart-wrap {
+            flex-grow: 1;
+            position: relative;
+            min-height: 0;
+        }
+        .chart-svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        .chart-empty {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            text-align: center;
+            padding: 20px;
+        }
+        .chart-tooltip {
+            display: none;
+            position: absolute;
+            z-index: 100;
+            background: rgba(15, 23, 42, 0.95);
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 0.78rem;
+            padding: 8px 10px;
+            pointer-events: none;
+            white-space: nowrap;
+        }
+        .tt-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
+        .tt-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+        /* Sensors tab: two rows rather than the chart tab's two columns. The top row is
+           the selector sidebar + chart; the table spans the full width beneath both, so
+           it gets the horizontal room its one-column-per-sensor-type header needs. */
+        #tab-sensors.active { flex-direction: column; }
+        .sensor-top {
+            display: flex;
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow: hidden;
+        }
+        .sensor-table-wrap {
+            flex: 0 0 auto;
+            max-height: 38%;
+            overflow: auto;
+            border-top: 1px solid var(--border);
+            padding: 10px 16px 12px 16px;
+        }
+        .sensor-note {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+        /* Status-aware cells: a dropout must never look like a measured value,
+           and a fault must never look like a trustworthy one. */
+        .val-cell.cell-nodata {
+            color: var(--text-muted);
+            font-style: italic;
+            background-color: transparent !important;
+        }
+        .val-cell.cell-fault {
+            outline: 2px solid #f59e0b;
+            outline-offset: -2px;
+            color: #fde68a;
+        }
+        /* Reading time under each sensor value — a sensor log is a record of
+           instants, so the time is part of the reading, not just a tooltip. */
+        .cell-sub {
+            display: block;
+            font-size: 0.68rem;
+            color: var(--text-muted);
+            font-family: monospace;
+            margin-top: 2px;
+            text-shadow: none;
+        }
+        .val-cell.cell-fault .cell-sub { color: #fcd34d; }
+
+        .status-key {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.72rem;
+            color: var(--text-muted);
+        }
+        .status-swatch {
+            width: 11px;
+            height: 11px;
+            border-radius: 3px;
+            flex-shrink: 0;
+            border: 1px solid var(--border);
+        }
+
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    </style>
+</head>
+<body>
+
+<div class="top-bar">
+    <div class="tabs">
+        <button id="btnTabTable" class="tab-btn active" onclick="switchTab('table')">Data Table</button>
+        <button id="btnTabMap" class="tab-btn" onclick="switchTab('map')">3D Map</button>
+        <button id="btnTabChart" class="tab-btn" onclick="switchTab('chart')">Live Chart</button>
+        <button id="btnTabSensors" class="tab-btn" onclick="switchTab('sensors')">Sensors</button>
+    </div>
+
+    <div class="config" id="configWrap">
+        <button class="secondary" id="configBtn" onclick="toggleConfig(event)"
+                title="Broker address and subscription topic">Config ▾</button>
+        <div class="config-popover" id="configPopover">
+            <label for="host">Broker IP</label>
+            <input type="text" id="host" value="127.0.0.1" placeholder="Broker IP">
+            <label for="port">Port</label>
+            <input type="number" id="port" value="9001" placeholder="Port">
+            <label for="topic">Topic</label>
+            <input type="text" id="topic" value="sim/coesi5/#" placeholder="Topic">
+        </div>
+    </div>
+    <button id="connectBtn" onclick="toggleConnection()">Connect</button>
+    
+    <div class="global-stats">
+        <div>Step: <span id="lblStep">0</span></div>
+        <div>Time: <span id="lblTime">0.00</span></div>
+    </div>
+
+    <div class="transport">
+        <button id="btnPlayPause" onclick="togglePlayback()" disabled title="Pause / resume the replay">❚❚</button>
+        <input type="range" id="scrubber" min="0" max="0" value="0" step="1" disabled
+               oninput="onScrubInput()" onchange="onScrubRelease()" title="Drag to seek">
+        <span class="scrub-label" id="lblScrub">– / –</span>
+        <select id="speedSelect" onchange="onSpeedChange()" disabled title="Playback speed">
+            <option value="0.25">0.25×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
+            <option value="5">5×</option>
+            <option value="10">10×</option>
+            <option value="25">25×</option>
+            <option value="50">50×</option>
+            <option value="100">100×</option>
+            <option value="200">200×</option>
+            <option value="500">500×</option>
+        </select>
+    </div>
+
+    <div style="flex-grow: 1;"></div>
+
+    <button class="secondary" onclick="toggleLogs()">Raw Logs</button>
+
+    <div class="status">
+        <span class="meta-badge" id="metaBadge">no run metadata</span>
+        <div class="meta-popover" id="metaPopover"></div>
+        <span id="statusText">Disconnected</span>
+        <div id="statusDot" class="status-dot"></div>
+    </div>
+</div>
+
+<!-- TAB: TABLE -->
+<div id="tab-table" class="tab-content active">
+    <div class="table-container">
+        <div class="table-toolbar">
+            <span>Show:</span>
+            <div class="range-toggle">
+                <button id="tableModeLast" class="range-btn active" onclick="setTableMode('last')">Last value</button>
+                <button id="tableModeMax" class="range-btn" onclick="setTableMode('max')">Max value</button>
+            </div>
+        </div>
+        <table id="heatmapTable">
+            <thead id="tableHead"></thead>
+            <tbody id="tableBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- TAB: MAP -->
+<div id="tab-map" class="tab-content">
+    <div id="map-container"></div>
+    <!-- Custom Tooltip for live updates -->
+    <div id="custom-tooltip" style="display: none; position: absolute; z-index: 1000; background: rgba(15, 23, 42, 0.9); color: white; border: 1px solid var(--border); border-radius: 4px; font-family: monospace; padding: 10px; white-space: pre-wrap; pointer-events: none;"></div>
+    
+    <div class="map-overlay">
+        <div style="display: flex; gap: 8px;">
+            <input type="text" id="projectIdInput" placeholder="Project ID" value="ee0520bb-2314-4c8a-a83b-67aec32b5caa" style="width: 300px;">
+            <button onclick="loadGeoJsonMap()">Load Map</button>
+        </div>
+        <div>
+            <label style="font-size: 0.85rem; color: var(--text-muted); display: block; margin-bottom: 4px;">Data source:</label>
+            <div class="range-toggle" style="width: fit-content;">
+                <button id="mapModeTruth" class="range-btn active" onclick="setMapMode('truth')">Ground truth</button>
+                <button id="mapModeSensor" class="range-btn" onclick="setMapMode('sensor')">Sensor reading</button>
+            </div>
+        </div>
+        <div>
+            <label style="font-size: 0.85rem; color: var(--text-muted); display: block; margin-bottom: 4px;">Color by Parameter:</label>
+            <select id="mapParameterSelect" style="width: 100%;" onchange="updateDeckGl()">
+                <option value="">-- None --</option>
+            </select>
+        </div>
+        <div id="mapSensorKey" style="display: none;" class="status-key">
+            <span class="status-swatch" style="background: rgb(148,163,184);"></span>
+            <span>flat grey = no current sensor reading (never reported, or dropout)</span>
+        </div>
+    </div>
+</div>
+
+<!-- TAB: LIVE CHART -->
+<div id="tab-chart" class="tab-content">
+    <div class="chart-sidebar">
+        <div>
+            <label>Search buildings</label>
+            <input type="text" id="buildingSearch" placeholder="e.g. bui_0037" oninput="renderBuildingList('sim')">
+        </div>
+        <label style="margin-bottom: -6px;">Buildings (max 8)</label>
+        <div class="building-list" id="buildingList">
+            <div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">Waiting for MQTT data...</div>
+        </div>
+        <div>
+            <label>Shared parameter</label>
+            <select id="chartParameterSelect" onchange="onChartParamChange('sim')">
+                <option value="">-- Select parameter --</option>
+            </select>
+        </div>
+        <button class="secondary" onclick="clearChartHistory('sim')">Clear history</button>
+    </div>
+    <div class="chart-main">
+        <div class="chart-header">
+            <div class="chart-legend" id="chartLegend"></div>
+            <div class="range-toggle">
+                <button id="rangeBtnAll" class="range-btn active" onclick="setChartRange('sim','all')">All points</button>
+                <button id="rangeBtnRecent" class="range-btn" onclick="setChartRange('sim','recent')">Last 400</button>
+            </div>
+        </div>
+        <div id="chartWrap" class="chart-wrap">
+            <svg id="liveChartSvg" class="chart-svg"></svg>
+            <div class="chart-empty" id="chartEmpty">Select one or more buildings and a shared parameter<br>to watch the chart build live.</div>
+            <div id="chartTooltip" class="chart-tooltip"></div>
+        </div>
+    </div>
+</div>
+
+<!-- TAB: SENSORS — same sidebar + chart machinery as Live Chart, pointed at the
+     sensors/# namespace instead of sim/coesi5/#. -->
+<div id="tab-sensors" class="tab-content">
+    <div class="sensor-top">
+        <div class="chart-sidebar">
+            <div>
+                <label>Search buildings</label>
+                <input type="text" id="sensorBuildingSearch" placeholder="e.g. bui_0037 or site" oninput="renderBuildingList('sensor')">
+            </div>
+            <label style="margin-bottom: -6px;">Buildings (max 8)</label>
+            <div class="building-list" id="sensorBuildingList">
+                <div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">Waiting for sensor data...</div>
+            </div>
+            <div>
+                <label>Sensor type</label>
+                <select id="sensorParameterSelect" onchange="onChartParamChange('sensor')">
+                    <option value="">-- Select sensor --</option>
+                </select>
+            </div>
+            <div class="sensor-note" id="sensorStreamStatus">No sensor data received yet.</div>
+            <button class="secondary" onclick="clearChartHistory('sensor')">Clear history</button>
+        </div>
+        <div class="chart-main">
+            <div class="chart-header">
+                <div class="chart-legend" id="sensorChartLegend"></div>
+                <div class="range-toggle">
+                    <button id="sensorRangeBtnAll" class="range-btn active" onclick="setChartRange('sensor','all')">All points</button>
+                    <button id="sensorRangeBtnRecent" class="range-btn" onclick="setChartRange('sensor','recent')">Last 400</button>
+                </div>
+            </div>
+            <div id="sensorChartWrap" class="chart-wrap">
+                <svg id="sensorChartSvg" class="chart-svg"></svg>
+                <div class="chart-empty" id="sensorChartEmpty">Select one or more buildings and a sensor type<br>to watch the readings build live.</div>
+                <div id="sensorChartTooltip" class="chart-tooltip"></div>
+            </div>
+        </div>
+    </div>
+    <div class="sensor-table-wrap">
+        <div style="display: flex; gap: 16px; align-items: center; margin-bottom: 8px;">
+            <span class="sensor-note"><b>Latest reading per building</b></span>
+            <span class="status-key"><span class="status-swatch" style="background: rgba(239,68,68,0.6);"></span>ok</span>
+            <span class="status-key"><span class="status-swatch" style="border-color: #f59e0b; background: transparent;"></span>fault (untrustworthy value)</span>
+            <span class="status-key"><span class="status-swatch" style="background: transparent;"></span>— = dropout / never reported</span>
+        </div>
+        <table id="sensorTable">
+            <thead id="sensorTableHead"></thead>
+            <tbody id="sensorTableBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<!-- Logs Panel -->
+<div class="logs-panel" id="logsPanel">
+    <div class="logs-header">
+        Raw MQTT Messages
+        <button class="secondary" style="padding: 4px 8px; font-size: 0.8rem;" onclick="toggleLogs()">Close</button>
+    </div>
+    <div class="logs-content" id="logsContent">
+        <div style="color: var(--text-muted);">Waiting for messages...</div>
+    </div>
+</div>
+
+<script>
+    // --- UI Logic ---
+    const TABS = { table: 'btnTabTable', map: 'btnTabMap', chart: 'btnTabChart', sensors: 'btnTabSensors' };
+    let activeTab = 'table';
+
+    function switchTab(tab) {
+        activeTab = tab;
+        for (const [name, btnId] of Object.entries(TABS)) {
+            document.getElementById(btnId).classList.toggle('active', name === tab);
+            document.getElementById('tab-' + name).classList.toggle('active', name === tab);
+        }
+        if (tab === 'map' && mapInstance) mapInstance.redraw();
+        if (tab === 'chart' || tab === 'sensors') {
+            const key = tab === 'chart' ? 'sim' : 'sensor';
+            renderBuildingList(key);
+            updateChartParameterDropdown(key);
+            renderChart(key);
+        }
+        if (tab === 'sensors') {
+            buildSensorTableStructure();
+            updateSensorTableValues();
+            updateSensorStreamStatus();
+        }
+    }
+
+    function toggleLogs() {
+        const panel = document.getElementById('logsPanel');
+        panel.classList.toggle('open');
+        if (panel.classList.contains('open')) {
+            updateUI(); // force render of logs
+        }
+    }
+
+    // Config drop-down: the broker host/port/topic inputs live behind a button so the
+    // top bar keeps its width for the transport controls. Closing on any outside click
+    // keeps it out of the way once the connection is set — which is nearly always.
+    function toggleConfig(ev) {
+        if (ev) ev.stopPropagation();
+        document.getElementById('configPopover').classList.toggle('open');
+    }
+    document.addEventListener('click', (ev) => {
+        const wrap = document.getElementById('configWrap');
+        if (wrap && !wrap.contains(ev.target)) {
+            document.getElementById('configPopover').classList.remove('open');
+        }
+    });
+
+    // --- MQTT Logic ---
+    let client = null;
+    let isConnected = false;
+    
+    // Core Data State
+    let buildings = new Set();
+    let models = new Set();
+    let varsPerModel = {}; 
+    let dataStore = {};
+    let maxStore = {};  // running maximum per building/model/variable (numeric only)
+    let maxVals = {};
+    
+    let currentStep = 0;
+    let currentTime = 0;
+    let logsHistory = [];
+    
+    // Track parameters for map dropdown
+    let activeParametersList = new Set();
+
+    // --- Sensor state (sensors/# namespace) ---
+    // Deliberately separate from dataStore: sensor readings carry a status and a
+    // nullable value, and must never be mistaken for ground truth.
+    const SENSOR_BASE = 'sensors';
+    let sensorMeta = null;              // retained sensors/_meta/sensors payload
+    let sensorTypeInfo = {};            // type -> { unit, per_building, ... } from the meta
+    let sensorBuildings = new Set();    // clean bui_NNNN_N ids (plus the site pseudo-building)
+    let sensorTypesSeen = new Set();    // types actually observed on the wire
+    let sensorStore = {};               // building -> type -> { value, status, step, t, unit }
+    let sensorMaxVals = {};             // type -> max |value| over ok readings, for colour scaling
+    let sensorLastMessageAt = 0;
+    let sensorStructureChanged = false;
+
+    function parseDatasetPath(pathStr) {
+        const parts = pathStr.split('/');
+        if (parts.length < 2) return null;
+        
+        const entityPart = parts[0]; 
+        const variable = parts.slice(1).join('/');
+        let model = entityPart.split('_')[0];
+        
+        let building = "Global";
+        const buiMatch = entityPart.match(/bui_\d+(_\d+)?/);
+        if (buiMatch) building = buiMatch[0];
+        
+        return { model, building, variable };
+    }
+
+    function toggleConnection() {
+        if (isConnected) disconnect();
+        else connect();
+    }
+
+    function connect() {
+        const host = document.getElementById('host').value.trim();
+        const port = Number(document.getElementById('port').value);
+        const topic = document.getElementById('topic').value.trim();
+        const clientId = "heatmap_" + Math.random().toString(16).substr(2, 8);
+
+        document.getElementById('statusText').innerText = 'Connecting...';
+        
+        client = new Paho.MQTT.Client(host, port, "/mqtt", clientId);
+        client.onConnectionLost = onConnectionLost;
+        client.onMessageArrived = onMessageArrived;
+
+        client.connect({
+            timeout: 5,
+            onSuccess: () => {
+                isConnected = true;
+                document.getElementById('statusDot').classList.add('connected');
+                document.getElementById('statusText').innerText = 'Connected';
+                const btn = document.getElementById('connectBtn');
+                btn.innerText = 'Disconnect';
+                btn.classList.add('danger');
+                btn.classList.remove('secondary');
+                
+                client.subscribe(topic);
+                // The retained sim/coesi5/_meta/run arrives on this subscribe if
+                // the wildcard covers it; subscribe explicitly otherwise.
+                if (!topic.endsWith('#')) client.subscribe(`${controlBase()}/_meta/run`);
+                // The sensor stream is an independent publisher on its own
+                // namespace, so it needs its own subscription regardless of the
+                // simulation topic typed above.
+                client.subscribe(`${SENSOR_BASE}/#`);
+                setTransportEnabled(true);
+                updateTransportUI();
+            },
+            onFailure: (err) => {
+                document.getElementById('statusText').innerText = 'Failed';
+                alert("Connection failed: " + (err.errorMessage || "Unknown"));
+            }
+        });
+    }
+
+    function disconnect() {
+        if (client) {
+            try { client.disconnect(); } catch (e) { console.warn("Disconnect error:", e); }
+        }
+        isConnected = false;
+        setTransportEnabled(false);
+        document.getElementById('statusDot').classList.remove('connected');
+        document.getElementById('statusText').innerText = 'Disconnected';
+        const btn = document.getElementById('connectBtn');
+        btn.innerText = 'Connect';
+        btn.classList.remove('danger');
+    }
+
+    function onConnectionLost(res) {
+        if (res.errorCode !== 0) console.warn("Connection lost:", res.errorMessage);
+        disconnect();
+    }
+
+    // --- Transport control (play / pause / seek) ---
+    let totalSteps = 0;
+    let isPlaying = true;      // the publisher starts playing
+    let isScrubbing = false;
+    let runMeta = null;
+
+    function controlBase() {
+        // "sim/coesi5/#" -> "sim/coesi5"
+        let base = document.getElementById('topic').value.trim();
+        base = base.replace(/\/*[#+]\s*$/, '');
+        return base.replace(/\/+$/, '');
+    }
+
+    function publishControl(command, payloadObj) {
+        if (!isConnected || !client) return;
+        const msg = new Paho.MQTT.Message(JSON.stringify(payloadObj || {}));
+        msg.destinationName = `${controlBase()}/_control/${command}`;
+        msg.qos = 0;
+        try { client.send(msg); } catch (e) { console.warn("Control publish failed:", e); }
+    }
+
+    function setTransportEnabled(enabled) {
+        document.getElementById('btnPlayPause').disabled = !enabled;
+        document.getElementById('scrubber').disabled = !enabled;
+        document.getElementById('speedSelect').disabled = !enabled;
+    }
+
+    function togglePlayback() {
+        isPlaying = !isPlaying;
+        publishControl(isPlaying ? 'play' : 'pause');
+        updateTransportUI();
+    }
+
+    function onSpeedChange() {
+        const multiplier = Number(document.getElementById('speedSelect').value);
+        publishControl('speed', { multiplier });
+    }
+
+    function onScrubInput() {
+        isScrubbing = true;
+        const step = Number(document.getElementById('scrubber').value);
+        document.getElementById('lblScrub').innerText =
+            `${step} / ${totalSteps ? totalSteps - 1 : '–'}`;
+    }
+
+    function onScrubRelease() {
+        const step = Number(document.getElementById('scrubber').value);
+        isScrubbing = false;
+        publishControl('seek', { step });
+        currentStep = step;      // optimistic, corrected by the next message
+        updateTransportUI();
+    }
+
+    function updateTransportUI() {
+        const btn = document.getElementById('btnPlayPause');
+        btn.innerText = isPlaying ? '❚❚' : '▶';
+        btn.title = isPlaying ? 'Pause the replay' : 'Resume the replay';
+
+        const scrubber = document.getElementById('scrubber');
+        if (totalSteps > 0 && Number(scrubber.max) !== totalSteps - 1) {
+            scrubber.max = totalSteps - 1;
+        }
+        if (!isScrubbing) {
+            scrubber.value = currentStep;
+            document.getElementById('lblScrub').innerText =
+                `${currentStep} / ${totalSteps ? totalSteps - 1 : '–'}`;
+        }
+    }
+
+    // --- Run metadata (provenance) ---
+    function applyRunMetadata(meta) {
+        runMeta = meta;
+        if (typeof meta.n_steps === 'number') totalSteps = meta.n_steps;
+
+        const source = meta.source || meta.source_type || 'unknown';
+        const shortSource = String(source).split('/').pop();
+        document.getElementById('metaBadge').innerText = `run: ${shortSource}`;
+        document.getElementById('metaPopover').innerText =
+            Object.entries(meta).map(([k, v]) => `${k.padEnd(12)} ${v}`).join('\n');
+        updateTransportUI();
+    }
+
+    let structureChanged = false;
+    let paramsChanged = false;
+
+    // Force map update token (changes every message batch)
+    let mapUpdateToken = 0;
+
+    function onMessageArrived(message) {
+        const topicName = message.destinationName || '';
+        let payload;
+        try { payload = JSON.parse(message.payloadString); } catch(e) { return; }
+
+        // Route by topic prefix. The two streams share a broker but nothing
+        // else: a sensor payload must never reach the simulation dataset parser,
+        // and a simulation payload must never reach the sensor parser.
+        if (topicName === `${SENSOR_BASE}/_meta/sensors`) {
+            applySensorMetadata(payload);
+            scheduleRender();
+            return;
+        }
+        if (topicName.indexOf(`${SENSOR_BASE}/`) === 0) {
+            handleSensorMessage(topicName, payload);
+            scheduleRender();
+            return;
+        }
+
+        if (topicName.endsWith('/_meta/run')) {
+            applyRunMetadata(payload);
+            return;
+        }
+        if (topicName.indexOf('/_control/') !== -1) return;
+
+        if (!payload.dataset) return;
+
+        const parsed = parseDatasetPath(payload.dataset);
+        if (!parsed) return;
+
+        const { model, building, variable } = parsed;
+        const val = payload.values;
+        const step = payload.step;
+
+        logsHistory.unshift(`${step} | ${payload.dataset}: ${val}`);
+        if (logsHistory.length > 50) logsHistory.pop();
+
+        // Assigned unconditionally: a seek can move the replay backwards.
+        currentStep = step;
+        if (typeof payload.total_steps === 'number') totalSteps = payload.total_steps;
+        if (model === 'time' && variable === 't') currentTime = val;
+
+        if (!buildings.has(building)) { buildings.add(building); structureChanged = true; }
+        if (!models.has(model)) { models.add(model); structureChanged = true; }
+        
+        if (!varsPerModel[model]) varsPerModel[model] = new Set();
+        if (!varsPerModel[model].has(variable)) { varsPerModel[model].add(variable); structureChanged = true; }
+
+        const paramKey = `${model}/${variable}`;
+        if (!activeParametersList.has(paramKey) && building !== "Global") {
+            activeParametersList.add(paramKey);
+            paramsChanged = true;
+        }
+
+        if (!dataStore[building]) dataStore[building] = {};
+        if (!dataStore[building][model]) dataStore[building][model] = {};
+
+        dataStore[building][model][variable] = val;
+
+        if (typeof val === 'number') {
+            if (!maxStore[building]) maxStore[building] = {};
+            if (!maxStore[building][model]) maxStore[building][model] = {};
+            const prevMax = maxStore[building][model][variable];
+            if (prevMax === undefined || val > prevMax) {
+                maxStore[building][model][variable] = val;
+            }
+        }
+
+        if (typeof val === 'number') {
+            const abs = Math.abs(val);
+            if (!maxVals[variable] || abs > maxVals[variable]) {
+                maxVals[variable] = abs;
+            }
+        }
+
+        if (typeof val === 'number' && building !== 'Global') {
+            recordChartHistory(simChart, paramKey, building, step, val);
+        }
+
+        mapUpdateToken++;
+        scheduleRender();
+    }
+
+    // Coalesce a burst of messages into one paint, but never drop the last one.
+    // A step arrives as ~175 messages within a few ms; the old leading-edge
+    // throttle painted on the first and swallowed the rest, so the table always
+    // showed the previous step's values under the current step number, and the
+    // final step before a pause never rendered at all. Now every burst ends
+    // with a paint, at most once per frame.
+    let renderQueued = false;
+    function scheduleRender() {
+        if (renderQueued) return;
+        renderQueued = true;
+        requestAnimationFrame(() => {
+            renderQueued = false;
+            updateUI();
+        });
+    }
+
+    // --- Sensor stream ingestion ---
+    function applySensorMetadata(meta) {
+        if (!meta || !Array.isArray(meta.sensor_types)) return;
+        sensorMeta = meta;
+        sensorTypeInfo = {};
+        meta.sensor_types.forEach(t => { if (t && t.type) sensorTypeInfo[t.type] = t; });
+        // Buildings and types come from the stream, never from a hardcoded list.
+        (meta.buildings || []).forEach(b => sensorBuildings.add(b));
+        if (meta.site_id) sensorBuildings.add(meta.site_id);
+        Object.keys(sensorTypeInfo).forEach(t => sensorTypesSeen.add(t));
+        sensorStructureChanged = true;
+    }
+
+    function sensorSiteId() {
+        return (sensorMeta && sensorMeta.site_id) || 'site';
+    }
+
+    // --- Simulated wall clock ---
+    // A sensor reports at a point in time, not at a simulation step, so the
+    // Sensors tab plots against `timestamp`. `step`/`t` stay in the payload for
+    // correlating against the ground-truth stream, and stay the axis for the
+    // Live Chart and Data Table, which show the simulation's own clock.
+    function sensorTimeFromPayload(payload) {
+        if (payload && payload.timestamp) {
+            const ms = Date.parse(payload.timestamp);
+            if (!isNaN(ms)) return ms;
+        }
+        // Fall back to reconstructing it from the discovery message, so a
+        // simulator that predates the timestamp field still gets a time axis.
+        return sensorTimeFromStep(payload ? payload.step : null);
+    }
+
+    function sensorTimeFromStep(step) {
+        if (typeof step !== 'number' || !sensorMeta || !sensorMeta.sim_start) return null;
+        const base = Date.parse(sensorMeta.sim_start);
+        const dt = Number(sensorMeta.dt_seconds);
+        if (isNaN(base) || !dt) return null;
+        return base + step * dt * 1000;
+    }
+
+    //: newest reading time seen, so "how stale is this cell" is measured against
+    //: the simulated clock rather than the viewer's real one — the run may be
+    //: replaying a date months away from today.
+    let sensorLatestTs = null;
+
+    function pad2(n) { return String(n).padStart(2, '0'); }
+    const MONTH_NAMES = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+    function fmtClock(ms) {
+        const d = new Date(ms);
+        return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    }
+
+    function fmtDayClock(ms) {
+        const d = new Date(ms);
+        return `${MONTH_NAMES[d.getMonth()]} ${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    }
+
+    function fmtFullTime(ms) {
+        const d = new Date(ms);
+        return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ` +
+               `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    }
+
+    // "behind the newest reading", in simulated time.
+    function fmtBehind(ms) {
+        if (sensorLatestTs === null || ms === null) return '';
+        const mins = Math.round((sensorLatestTs - ms) / 60000);
+        if (mins <= 0) return 'latest';
+        if (mins < 60) return `${mins} min behind`;
+        const hours = Math.round(mins / 60);
+        return hours < 48 ? `${hours} h behind` : `${Math.round(hours / 24)} d behind`;
+    }
+
+    // Is this sensor type meaningful for this building?
+    //
+    // "Has already reported" is not the right question. The retained discovery
+    // message lists every building before a single reading arrives, so requiring a
+    // stored reading here would blank the sensor-type dropdown the moment a user
+    // selects a building — indistinguishable from a broken dashboard, when the
+    // truthful answer is "this sensor exists and has not reported yet". So fall
+    // back to the declared scope: per-building types apply to real buildings,
+    // site-wide types only to the site pseudo-building. The chart then shows its
+    // "Waiting for live data on <type>" state, which is the honest one.
+    function sensorAppliesTo(building, type) {
+        if (sensorStore[building] && sensorStore[building][type]) return true;
+        const info = sensorTypeInfo[type];
+        if (!info) return false;   // seen on the wire but undeclared: trust only real data
+        return info.per_building === false
+            ? building === sensorSiteId()
+            : building !== sensorSiteId();
+    }
+
+    function handleSensorMessage(topicName, payload) {
+        const parts = topicName.split('/');           // sensors/<building>/<sensor_type>
+        if (parts.length < 3) return;
+        const building = payload.building || parts[1];
+        const type = payload.sensor_type || parts[2];
+        // Reserved sub-namespaces are not readings.
+        if (!building || !type || building.charAt(0) === '_' || type.charAt(0) === '_') return;
+
+        const status = payload.status || 'ok';
+        // A dropout carries value null. It is stored as null on purpose: the
+        // renderers distinguish "no reading" from "measured 0" downstream, and
+        // coercing it here would destroy exactly the information this tab exists
+        // to show.
+        const value = (status === 'dropout' || payload.value === null || payload.value === undefined)
+            ? null : payload.value;
+
+        if (!sensorBuildings.has(building)) { sensorBuildings.add(building); sensorStructureChanged = true; }
+        if (!sensorTypesSeen.has(type)) { sensorTypesSeen.add(type); sensorStructureChanged = true; }
+
+        const ts = sensorTimeFromPayload(payload);
+        if (ts !== null && (sensorLatestTs === null || ts > sensorLatestTs)) sensorLatestTs = ts;
+
+        if (!sensorStore[building]) sensorStore[building] = {};
+        sensorStore[building][type] = {
+            value, status, ts,
+            step: payload.step,
+            t: payload.t,
+            unit: payload.unit || (sensorTypeInfo[type] || {}).unit || '',
+            cumulative: payload.cumulative,
+            cumulative_unit: payload.cumulative_unit
+        };
+
+        // Only trustworthy readings set the colour scale — a fault spike would
+        // otherwise flatten every real value on the map into the bottom of the ramp.
+        if (status === 'ok' && typeof value === 'number') {
+            const abs = Math.abs(value);
+            if (!sensorMaxVals[type] || abs > sensorMaxVals[type]) sensorMaxVals[type] = abs;
+        }
+
+        sensorLastMessageAt = Date.now();
+        logsHistory.unshift(`${payload.step} | ${topicName}: ${value === null ? 'null' : value} [${status}]`);
+        if (logsHistory.length > 50) logsHistory.pop();
+
+        if (typeof payload.step === 'number') {
+            // Nulls are recorded too: the gap is data. The point keeps `step` as
+            // its storage key (that is what insertion order and decimation are
+            // built on) and carries `ts` for the time axis.
+            recordChartHistory(sensorChart, type, building, payload.step, value, status, ts);
+        }
+        mapUpdateToken++;
+    }
+
+    function updateUI() {
+        document.getElementById('lblStep').innerText = currentStep;
+        document.getElementById('lblTime').innerText = typeof currentTime === 'number' ? currentTime.toFixed(2) : currentTime;
+        updateTransportUI();
+
+        const logsPanel = document.getElementById('logsPanel');
+        if (logsPanel.classList.contains('open')) {
+            document.getElementById('logsContent').innerHTML = logsHistory.map(l => `<div class="log-entry">${l}</div>`).join('');
+        }
+
+        if (structureChanged) {
+            buildTableStructure();
+            if (activeTab === 'chart') renderBuildingList('sim');
+            structureChanged = false;
+        }
+
+        if (sensorStructureChanged) {
+            buildSensorTableStructure();
+            if (activeTab === 'sensors') renderBuildingList('sensor');
+            updateChartParameterDropdown('sensor');
+            if (mapDataMode === 'sensor') updateParameterDropdown();
+            sensorStructureChanged = false;
+        }
+
+        if (paramsChanged) {
+            updateParameterDropdown();
+            updateChartParameterDropdown('sim');
+            paramsChanged = false;
+        }
+
+        updateTableValues();
+        updateDeckGl(); // Ensure map updates with new data
+        if (typeof renderTooltip === 'function') renderTooltip();
+        if (activeTab === 'chart') renderChart('sim');
+        if (activeTab === 'sensors') {
+            renderChart('sensor');
+            updateSensorTableValues();
+            updateSensorStreamStatus();
+        }
+    }
+
+    // --- Table UI Logic ---
+    // One grid-table renderer, two callers: the simulation Data Table and the
+    // Sensors tab's latest-reading table. `groups` is [{ name, cols: [...] }],
+    // `rows` the row keys, and `cellIdFor(row, group, col)` the stable cell id.
+    function buildGridTable(headEl, bodyEl, cornerLabel, groups, rows, cellIdFor, colLabelFor) {
+        headEl.innerHTML = '';
+        bodyEl.innerHTML = '';
+
+        const trGroup = document.createElement('tr');
+        trGroup.innerHTML = `<th class="th-model" style="z-index:30;">${cornerLabel}</th>`;
+        groups.forEach(g => {
+            trGroup.innerHTML += `<th class="th-model" colspan="${g.cols.length}">${g.name}</th>`;
+        });
+        headEl.appendChild(trGroup);
+
+        const trCol = document.createElement('tr');
+        trCol.innerHTML = `<th class="th-var" style="z-index:20;"></th>`;
+        groups.forEach(g => {
+            g.cols.forEach(c => {
+                const label = colLabelFor ? colLabelFor(g.name, c) : c;
+                trCol.innerHTML += `<th class="th-var">${label}</th>`;
+            });
+        });
+        headEl.appendChild(trCol);
+
+        rows.forEach(r => {
+            const tr = document.createElement('tr');
+            tr.id = `row_${r}`;
+            tr.innerHTML = `<td class="td-bui">${r}</td>`;
+            groups.forEach(g => {
+                g.cols.forEach(c => {
+                    tr.innerHTML += `<td id="${cellIdFor(r, g.name, c)}" class="val-cell"></td>`;
+                });
+            });
+            bodyEl.appendChild(tr);
+        });
+    }
+
+    // `valueFor(row, group, col)` returns null to leave a cell untouched, or
+    // { text, bg, cls, title } to paint it.
+    function paintGridTable(groups, rows, cellIdFor, valueFor) {
+        rows.forEach(r => {
+            groups.forEach(g => {
+                g.cols.forEach(c => {
+                    const cell = document.getElementById(cellIdFor(r, g.name, c));
+                    if (!cell) return;
+                    const v = valueFor(r, g.name, c);
+                    if (!v) return;
+                    if (v.sub) {
+                        cell.innerHTML = `${escapeHtml(v.text)}<span class="cell-sub">${escapeHtml(v.sub)}</span>`;
+                    } else {
+                        cell.innerText = v.text;
+                    }
+                    cell.style.backgroundColor = v.bg || 'transparent';
+                    cell.className = 'val-cell' + (v.cls ? ' ' + v.cls : '');
+                    cell.title = v.title || '';
+                });
+            });
+        });
+    }
+
+    function escapeHtml(v) {
+        return String(v).replace(/[&<>"']/g, ch => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]
+        ));
+    }
+
+    // Red for positive, blue for negative, alpha by magnitude — the scale both
+    // tables and the map share.
+    function heatColor(val, max) {
+        const intensity = Math.min(Math.abs(val) / (max || 1), 1.0);
+        return val >= 0 ? `rgba(239, 68, 68, ${intensity})` : `rgba(59, 130, 246, ${intensity})`;
+    }
+
+    function fmtCellNumber(val) {
+        return (typeof val === 'number' && val % 1 !== 0) ? val.toFixed(2) : String(val);
+    }
+
+    function simTableGroups() {
+        return Array.from(models).sort()
+            .map(m => ({ name: m, cols: Array.from(varsPerModel[m]).sort() }));
+    }
+
+    function simTableRows() {
+        return Array.from(buildings).sort((a, b) => a === 'Global' ? -1 : a.localeCompare(b));
+    }
+
+    function simCellId(row, group, col) {
+        return `cell_${row}_${group}_${col}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+
+    function buildTableStructure() {
+        buildGridTable(
+            document.getElementById('tableHead'),
+            document.getElementById('tableBody'),
+            'Building / Entity',
+            simTableGroups(), simTableRows(), simCellId
+        );
+    }
+
+    let tableValueMode = 'last';        // 'last' = latest received, 'max' = running maximum
+
+    function setTableMode(mode) {
+        tableValueMode = mode;
+        document.getElementById('tableModeLast').classList.toggle('active', mode === 'last');
+        document.getElementById('tableModeMax').classList.toggle('active', mode === 'max');
+        updateTableValues();
+    }
+
+    function simCellValue(row, group, col) {
+        const varsObj = (dataStore[row] || {})[group];
+        if (!varsObj || varsObj[col] === undefined) return null;
+        // In max mode use the running maximum; non-numeric values fall back to last
+        let val = varsObj[col];
+        if (tableValueMode === 'max' && maxStore[row] && maxStore[row][group]
+            && maxStore[row][group][col] !== undefined) {
+            val = maxStore[row][group][col];
+        }
+        return {
+            text: fmtCellNumber(val),
+            bg: typeof val === 'number' ? heatColor(val, maxVals[col]) : 'transparent'
+        };
+    }
+
+    function updateTableValues() {
+        paintGridTable(simTableGroups(), simTableRows(), simCellId, simCellValue);
+    }
+
+    // --- Sensor table (same renderer, status-aware cells) ---
+    function sensorTableGroups() {
+        const cols = Array.from(sensorTypesSeen).sort();
+        return cols.length ? [{ name: 'sensor reading', cols }] : [];
+    }
+
+    function sensorTableRows() {
+        return Array.from(sensorBuildings).sort();
+    }
+
+    function sensorCellId(row, group, col) {
+        return `scell_${row}_${col}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+
+    function sensorColLabel(group, col) {
+        const unit = (sensorTypeInfo[col] || {}).unit;
+        return unit ? `${col} (${unit})` : col;
+    }
+
+    function buildSensorTableStructure() {
+        buildGridTable(
+            document.getElementById('sensorTableHead'),
+            document.getElementById('sensorTableBody'),
+            'Building',
+            sensorTableGroups(), sensorTableRows(), sensorCellId, sensorColLabel
+        );
+    }
+
+    function sensorCellValue(row, group, col) {
+        const r = (sensorStore[row] || {})[col];
+        // Never reported at all — an em dash, not a zero and not a blank that
+        // could be read as "measured nothing".
+        if (!r) return { text: '—', cls: 'cell-nodata', title: 'no reading received' };
+
+        // Readings are stamped with the time they were taken, not the step they
+        // came from: a sensor log is a record of instants.
+        const when = r.ts !== null && r.ts !== undefined ? fmtClock(r.ts) : null;
+        const whenFull = r.ts !== null && r.ts !== undefined
+            ? `${fmtFullTime(r.ts)} (${fmtBehind(r.ts)})` : `step ${r.step}`;
+
+        if (r.status === 'dropout' || r.value === null) {
+            return {
+                text: '—', sub: when ? `no reading ${when}` : 'no reading',
+                cls: 'cell-nodata', title: `dropout at ${whenFull}`
+            };
+        }
+        const text = fmtCellNumber(r.value);
+        if (r.status === 'fault') {
+            return {
+                text: `⚠ ${text}`, sub: when || '',
+                cls: 'cell-fault', title: `faulty reading at ${whenFull} — do not trust`
+            };
+        }
+        let title = whenFull;
+        if (r.cumulative !== undefined) title += ` · ${r.cumulative} ${r.cumulative_unit || ''}`;
+        return {
+            text, sub: when || '',
+            bg: typeof r.value === 'number' ? heatColor(r.value, sensorMaxVals[col]) : 'transparent',
+            title
+        };
+    }
+
+    function updateSensorTableValues() {
+        paintGridTable(sensorTableGroups(), sensorTableRows(), sensorCellId, sensorCellValue);
+    }
+
+    function updateSensorStreamStatus() {
+        const el = document.getElementById('sensorStreamStatus');
+        if (!el) return;
+        if (!sensorLastMessageAt) {
+            el.innerText = sensorMeta
+                ? 'Sensor discovery received; waiting for the first reading.'
+                : 'No sensor data received yet. Is sensor_simulator.py running?';
+            return;
+        }
+        // If the simulator stops, this simply keeps ageing — the tab shows stale
+        // data rather than hanging or clearing itself.
+        const age = Math.round((Date.now() - sensorLastMessageAt) / 1000);
+        // Two clocks, deliberately distinguished: how long since a message
+        // actually arrived (real seconds), and where the simulated stream has
+        // got to (the timestamp the readings carry).
+        const simClock = sensorLatestTs !== null ? ` · sim clock ${fmtDayClock(sensorLatestTs)}` : '';
+        el.innerText = age < 5
+            ? `Live · ${sensorTypesSeen.size} sensor types, ${sensorBuildings.size} buildings${simClock}`
+            : `Stale · last reading ${age}s ago (${sensorTypesSeen.size} types)${simClock}`;
+    }
+
+    // 'truth' = colour by simulation value (unchanged behaviour), 'sensor' =
+    // colour by the latest sensor reading for the selected sensor type.
+    let mapDataMode = 'truth';
+
+    function setMapMode(mode) {
+        if (mode === mapDataMode) return;
+        mapDataMode = mode;
+        document.getElementById('mapModeTruth').classList.toggle('active', mode === 'truth');
+        document.getElementById('mapModeSensor').classList.toggle('active', mode === 'sensor');
+        document.getElementById('mapSensorKey').style.display = mode === 'sensor' ? 'flex' : 'none';
+        updateParameterDropdown();
+        updateDeckGl();
+        renderTooltip();
+    }
+
+    // Only per-building sensor types can colour individual buildings; a
+    // site-wide reading would paint every building the same and say nothing.
+    function mapSensorTypes() {
+        return Array.from(sensorTypesSeen).sort().filter(t => {
+            const info = sensorTypeInfo[t];
+            if (info) return info.per_building !== false;
+            return Object.keys(sensorStore).some(b => b !== sensorSiteId() && sensorStore[b][t]);
+        });
+    }
+
+    function mapParameterOptions() {
+        return mapDataMode === 'sensor' ? mapSensorTypes() : Array.from(activeParametersList).sort();
+    }
+
+    function updateParameterDropdown() {
+        const select = document.getElementById('mapParameterSelect');
+        const currentVal = select.value;
+
+        select.innerHTML = '<option value="">-- None --</option>';
+
+        const options = mapParameterOptions();
+        options.forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p;
+            opt.innerText = p;
+            select.appendChild(opt);
+        });
+
+        if (options.indexOf(currentVal) !== -1) {
+            select.value = currentVal;
+        }
+    }
+
+    // The clean bui_NNNN_N id behind a GeoJSON feature name like "BUI-0037".
+    // One matching scheme, used by ground truth and sensors alike.
+    function matchBuildingId(featureName, candidates) {
+        if (!featureName) return null;
+        const m = featureName.match(/\d+/);
+        if (!m) return null;
+        for (const b of candidates) {
+            if (b.includes(m[0])) return b;
+        }
+        return null;
+    }
+
+    // --- Deck.GL Map Logic ---
+    const {DeckGL, GeoJsonLayer} = deck;
+    let mapInstance = null;
+    let geojsonData = null;
+
+    function loadGeoJsonMap() {
+        const pid = document.getElementById('projectIdInput').value.trim();
+        if (!pid) return alert("Please enter a Project ID");
+
+        // The frontend uses http://eclab-cloud3.polito.it:8001/api/v1/vector/get_buildings_geojson/{pid}/{pid}
+        // Wrapped with a local python CORS proxy because corsproxy.io timed out (522) trying to reach the internal server
+        const targetUrl = `http://eclab-cloud3.polito.it:8001/api/v1/vector/get_buildings_geojson/${pid}/${pid}`;
+        // Relative, so the page works from whatever host/port it was served on.
+        const url = `/proxy/${encodeURIComponent(targetUrl)}`;
+        
+        fetch(url)
+            .then(r => r.json())
+            .then(data => {
+                if (!data || !data.features || data.features.length === 0) {
+                    throw new Error("Invalid or empty GeoJSON returned.");
+                }
+                geojsonData = data;
+                initOrUpdateDeck();
+            })
+            .catch(e => alert("Error loading map GeoJSON: " + e.message));
+    }
+
+    function getFeatureCenter(geojson) {
+        try {
+            let coords = geojson.features[0].geometry.coordinates;
+            while(Array.isArray(coords[0])) coords = coords[0];
+            return { lon: coords[0], lat: coords[1] };
+        } catch(e) {
+            return { lon: -122.4, lat: 37.7 };
+        }
+    }
+
+    function updateDeckGl() {
+        if (!geojsonData) return;
+        initOrUpdateDeck();
+    }
+
+    function initOrUpdateDeck() {
+        const selectedParam = document.getElementById('mapParameterSelect').value;
+        
+        const layer = new GeoJsonLayer({
+            id: 'buildings-layer',
+            data: geojsonData,
+            stroked: true,
+            filled: true,
+            extruded: true,
+            wireframe: true,
+            getElevation: f => f.properties.height || 10,
+            getFillColor: f => {
+                if (!selectedParam) return [100, 116, 139, 150]; // Slate gray
+                const bName = f.properties.building_name; // e.g. "BUI-0037"
+                if (!bName) return [50, 50, 50, 100];
+
+                if (mapDataMode === 'sensor') return sensorFillColor(bName, selectedParam);
+
+                const [model, variable] = selectedParam.split('/');
+                const targetBuilding = matchBuildingId(bName, buildings);
+
+                if (!targetBuilding || !dataStore[targetBuilding] || !dataStore[targetBuilding][model] || dataStore[targetBuilding][model][variable] === undefined) {
+                    return [50, 50, 50, 100]; // Dark gray if no data
+                }
+
+                const val = dataStore[targetBuilding][model][variable];
+                const max = maxVals[variable] || 1;
+                const intensity = Math.min(Math.abs(val) / max, 1.0);
+
+                if (val >= 0) {
+                    return [239, 68, 68, intensity * 255]; // Red
+                } else {
+                    return [59, 130, 246, intensity * 255]; // Blue
+                }
+            },
+            getLineColor: [255, 255, 255, 100],
+            pickable: true,
+            updateTriggers: {
+                getFillColor: [selectedParam, mapDataMode, mapUpdateToken] // Triggers redraw on new mqtt data
+            }
+        });
+
+        if (!mapInstance) {
+            const center = getFeatureCenter(geojsonData);
+            mapInstance = new DeckGL({
+                container: 'map-container',
+                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+                initialViewState: {
+                    longitude: center.lon,
+                    latitude: center.lat,
+                    zoom: 16,
+                    pitch: 45,
+                    bearing: 0
+                },
+                controller: true,
+                layers: [layer],
+                onHover: (info) => {
+                    currentHoverInfo = info;
+                    renderTooltip();
+                }
+            });
+        } else {
+            mapInstance.setProps({ layers: [layer] });
+        }
+    }
+
+    // Flat, near-opaque slate that is deliberately *not* part of the red/blue
+    // value ramp. A building with no current reading must be unmistakable as
+    // such: colouring it as if its value were 0, or leaving the last ground
+    // truth colour in place, would hide exactly what the sensor layer exists to
+    // reveal.
+    const SENSOR_NO_DATA_COLOR = [148, 163, 184, 235];
+
+    function sensorReadingFor(featureName, sensorType) {
+        const b = matchBuildingId(featureName, sensorBuildings);
+        if (!b) return null;
+        const r = (sensorStore[b] || {})[sensorType];
+        if (!r) return null;
+        return Object.assign({ building: b }, r);
+    }
+
+    function sensorFillColor(featureName, sensorType) {
+        const r = sensorReadingFor(featureName, sensorType);
+        // Never reported, or the most recent report was a dropout → no data.
+        if (!r || r.status === 'dropout' || r.value === null || typeof r.value !== 'number') {
+            return SENSOR_NO_DATA_COLOR;
+        }
+        const max = sensorMaxVals[sensorType] || 1;
+        const intensity = Math.min(Math.abs(r.value) / max, 1.0);
+        if (r.status === 'fault') {
+            // A reading we have, but not one to trust: amber, off the value ramp.
+            return [245, 158, 11, 220];
+        }
+        return r.value >= 0
+            ? [239, 68, 68, intensity * 255]
+            : [59, 130, 246, intensity * 255];
+    }
+
+    let currentHoverInfo = null;
+
+    function renderTooltip() {
+        const tooltip = document.getElementById('custom-tooltip');
+        if (!currentHoverInfo || !currentHoverInfo.object) {
+            tooltip.style.display = 'none';
+            return;
+        }
+
+        // Position
+        tooltip.style.display = 'block';
+        tooltip.style.left = (currentHoverInfo.x + 15) + 'px';
+        tooltip.style.top = (currentHoverInfo.y + 15) + 'px';
+
+        // Content
+        const object = currentHoverInfo.object;
+        const bName = object.properties.building_name || "Unknown";
+        let text = `Building: ${bName}`;
+        
+        const selParam = document.getElementById('mapParameterSelect').value;
+        if (selParam && mapDataMode === 'sensor') {
+            const r = sensorReadingFor(bName, selParam);
+            if (!r) {
+                text += `\n${selParam}: no sensor reading`;
+            } else if (r.status === 'dropout' || r.value === null) {
+                text += `\n${selParam}: — (dropout)`;
+                text += `\nStep: ${r.step}`;
+            } else {
+                const shown = typeof r.value === 'number' && r.value % 1 !== 0 ? r.value.toFixed(2) : r.value;
+                text += `\n${selParam}: ${shown} ${r.unit || ''}`.trimEnd();
+                if (r.status === 'fault') text += '  ⚠ faulty';
+                if (r.cumulative !== undefined) text += `\nTotal: ${r.cumulative} ${r.cumulative_unit || ''}`;
+                text += `\nStep: ${r.step}`;
+            }
+        } else if (selParam) {
+            const [model, variable] = selParam.split('/');
+            const targetBuilding = matchBuildingId(bName, buildings);
+            if (targetBuilding && dataStore[targetBuilding] && dataStore[targetBuilding][model]) {
+                const val = dataStore[targetBuilding][model][variable];
+                if (val !== undefined) {
+                    text += `\n${variable}: ${typeof val === 'number' && val % 1 !== 0 ? val.toFixed(2) : val}`;
+                    text += `\nStep: ${currentStep}`;
+                } else {
+                    text += `\n${variable}: Waiting for data...`;
+                }
+            }
+        }
+        tooltip.innerText = text;
+    }
+
+    // --- Live Chart Logic ---
+    // 8-slot categorical palette validated for CVD separation and >=3:1 contrast
+    // against this dashboard's dark surface (#0f172a).
+    const CHART_COLORS = ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767', '#d55181', '#d95926'];
+    const MAX_CHART_SERIES = 8;
+    const MAX_HISTORY_POINTS = 2000;
+    const RECENT_WINDOW = 400;
+    const FAULT_COLOR = '#f59e0b';
+
+    // One chart implementation, two instances. The Live Chart's point storage
+    // (step-ordered insertion + deterministic decimation) was fixed twice already;
+    // the Sensors tab points the *same* machinery at the sensors/# namespace
+    // rather than growing a second copy that could regress either fix.
+    //
+    // Per-instance state that used to be module globals now lives on the context:
+    //   history        { paramKey: { building: [{step, val, status}, ...] } }
+    //   historyVersion { `${paramKey}|${building}`: int } — bumped on every write
+    //   decimCache     `${paramKey}|${building}|${mode}` -> { version, points }
+    //   selected       building -> colour slot index (sticky while selected)
+    //
+    // The authoritative history is never decimated in place: the reference run is
+    // 4320 steps x <=8 selected buildings, which is small, and keeping it whole is
+    // what makes the rendered view reproducible.
+    const CHART_CTX = {};
+
+    function makeChartContext(cfg) {
+        const ctx = Object.assign({
+            history: {},
+            historyVersion: {},
+            decimCache: new Map(),
+            selected: new Map(),
+            hoverX: null,
+            rangeMode: 'all'
+        }, cfg);
+        CHART_CTX[cfg.key] = ctx;
+        return ctx;
+    }
+
+    function chartCtx(key) { return CHART_CTX[key]; }
+    function chartEl(ctx, name) { return document.getElementById(ctx.els[name]); }
+
+    const simChart = makeChartContext({
+        key: 'sim',
+        els: {
+            search: 'buildingSearch', list: 'buildingList', param: 'chartParameterSelect',
+            legend: 'chartLegend', wrap: 'chartWrap', svg: 'liveChartSvg',
+            empty: 'chartEmpty', tooltip: 'chartTooltip',
+            rangeAll: 'rangeBtnAll', rangeRecent: 'rangeBtnRecent'
+        },
+        emptyHint: 'Select one or more buildings and a shared parameter<br>to watch the chart build live.',
+        waitingHint: 'Waiting for MQTT data...',
+        paramPlaceholder: '-- Select parameter --',
+        allBuildings: () => Array.from(buildings).filter(b => b !== 'Global').sort(),
+        allParams: () => Array.from(activeParametersList).sort(),
+        hasParam: (b, p) => buildingHasParam(b, p),
+        // The Live Chart shows the simulation's own clock: steps, unchanged.
+        timeAxis: false
+    });
+
+    const sensorChart = makeChartContext({
+        key: 'sensor',
+        els: {
+            search: 'sensorBuildingSearch', list: 'sensorBuildingList', param: 'sensorParameterSelect',
+            legend: 'sensorChartLegend', wrap: 'sensorChartWrap', svg: 'sensorChartSvg',
+            empty: 'sensorChartEmpty', tooltip: 'sensorChartTooltip',
+            rangeAll: 'sensorRangeBtnAll', rangeRecent: 'sensorRangeBtnRecent'
+        },
+        emptyHint: 'Select one or more buildings and a sensor type<br>to watch the readings build live.',
+        waitingHint: 'Waiting for sensor data...',
+        paramPlaceholder: '-- Select sensor --',
+        allBuildings: () => Array.from(sensorBuildings).sort(),
+        allParams: () => Array.from(sensorTypesSeen).sort(),
+        hasParam: (b, t) => sensorAppliesTo(b, t),
+        // Sensors report at wall-clock instants, so this axis is real time
+        // (falling back to steps if no timestamps are available at all).
+        timeAxis: true
+    });
+
+    // --- X axis: steps for the Live Chart, real time for Sensors ---
+    // A chart renders against whichever domain its context declares; everything
+    // upstream of this (storage, ordering, decimation) stays step-keyed.
+    const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
+    const TIME_TICK_LADDER = [
+        MINUTE, 2 * MINUTE, 5 * MINUTE, 10 * MINUTE, 15 * MINUTE, 30 * MINUTE,
+        HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR,
+        DAY, 2 * DAY, 7 * DAY, 14 * DAY, 28 * DAY
+    ];
+
+    function chartUsesTime(ctx, series) {
+        return !!ctx.timeAxis && series.some(s => s.points.some(p => p.ts !== null && p.ts !== undefined));
+    }
+
+    function xValueOf(useTime) {
+        return useTime ? (p => (p.ts !== null && p.ts !== undefined ? p.ts : null))
+                       : (p => p.step);
+    }
+
+    // Tick spacing is at least the selected sensor's own report interval, so a
+    // 10-minute sensor gets ticks 10 minutes apart that land on actual readings
+    // instead of arbitrary step-derived positions.
+    function timeTickStep(span, param) {
+        const info = sensorTypeInfo[param] || {};
+        const reportMs = Number(info.interval_seconds || 0) * 1000;
+        const fits = c => span / c <= 9;
+
+        if (reportMs > 0) {
+            // Only whole multiples of the report interval are eligible. A tick at
+            // 30 minutes on a sensor that reports every 20 points at a time no
+            // reading exists for — being merely "coarse enough" is not enough.
+            const aligned = [reportMs].concat(
+                TIME_TICK_LADDER.filter(c => c > reportMs && c % reportMs === 0)
+            );
+            for (const c of aligned) if (fits(c)) return c;
+            // Nothing on the ladder divides evenly: keep doubling the interval.
+            let c = aligned[aligned.length - 1];
+            while (!fits(c) && c < 365 * DAY) c *= 2;
+            return c;
+        }
+
+        for (const c of TIME_TICK_LADDER) if (fits(c)) return c;
+        return TIME_TICK_LADDER[TIME_TICK_LADDER.length - 1];
+    }
+
+    // Ticks land on local wall-clock boundaries (:00, :10, …), not on offsets
+    // from the epoch, which is what makes them read as clock times.
+    function timeTicks(min, max, stepMs) {
+        const offset = -new Date(min).getTimezoneOffset() * MINUTE;
+        const out = [];
+        let t = Math.ceil((min + offset) / stepMs) * stepMs - offset;
+        for (; t <= max && out.length < 40; t += stepMs) out.push(t);
+        return out;
+    }
+
+    function fmtAxisTime(ms, span) {
+        // Include the date once the visible window stops being "a day".
+        return span > DAY ? fmtDayClock(ms) : fmtClock(ms);
+    }
+
+    // Min/max decimation for rendering only: keeps the first and last points and the
+    // extremes of every bucket, so the full-timeline shape (peaks included) survives no
+    // matter how long the simulation runs.
+    //
+    // Buckets are aligned to absolute step numbers (step / bucket), not to positions in
+    // the array, and the bucket width derives only from the series' step span. That
+    // makes the output a pure function of the set of (step, val) pairs: the same steps
+    // decimate to the same points no matter what order they arrived in, how many times
+    // this ran before, or which scrub path produced them.
+    // Points with `val === null` are dropouts. They survive decimation on purpose:
+    // dropping one would let the line be drawn straight across missing data, which
+    // is the exact lie this whole layer exists to prevent. A bucket containing a
+    // dropout therefore emits up to three points instead of two.
+    function compressSeries(series, maxPoints) {
+        if (series.length <= maxPoints) return series;
+        const span = series[series.length - 1].step - series[0].step + 1;
+        let bucket = 1;
+        while (span / bucket > maxPoints / 2) bucket *= 2;  // <=2 real points emitted per bucket
+
+        const out = [];
+        // Points are emitted in step order, so deduping against the tail is enough.
+        const push = p => { if (!out.length || out[out.length - 1].step !== p.step) out.push(p); };
+
+        push(series[0]);
+        let i = 0;
+        while (i < series.length) {
+            const b = Math.floor(series[i].step / bucket);
+            let mn = null, mx = null, gap = null, j = i;
+            while (j < series.length && Math.floor(series[j].step / bucket) === b) {
+                const p = series[j];
+                if (p.val === null) { if (gap === null) gap = p; }
+                else {
+                    if (mn === null || p.val < mn.val) mn = p;
+                    if (mx === null || p.val > mx.val) mx = p;
+                }
+                j++;
+            }
+            const picks = [];
+            if (mn) picks.push(mn);
+            if (mx && mx !== mn) picks.push(mx);
+            if (gap) picks.push(gap);
+            picks.sort((a, c) => a.step - c.step);
+            picks.forEach(push);
+            i = j;
+        }
+        push(series[series.length - 1]);
+        return out;
+    }
+
+    // Decimated view of one authoritative series, recomputed from scratch whenever that
+    // series changes. Cached only to keep the 150 ms render loop cheap.
+    function chartPointsFor(ctx, paramKey, building, mode) {
+        const full = (ctx.history[paramKey] || {})[building] || [];
+        const key = `${paramKey}|${building}|${mode}`;
+        const version = ctx.historyVersion[`${paramKey}|${building}`] || 0;
+        const cached = ctx.decimCache.get(key);
+        if (cached && cached.version === version) return cached.points;
+
+        const src = mode === 'recent' ? full.slice(-RECENT_WINDOW) : full;
+        const points = src.length ? compressSeries(src, MAX_HISTORY_POINTS) : src;
+        ctx.decimCache.set(key, { version, points });
+        return points;
+    }
+
+    // Lowest index whose step is >= the target, i.e. where the target belongs if absent.
+    // Binary search rather than a scan: seek/loop mean arrival order is no longer step
+    // order, and this runs once per incoming message across ~175 topics per step.
+    function historyInsertionPoint(series, step) {
+        let lo = 0, hi = series.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (series[mid].step < step) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    function recordChartHistory(ctx, paramKey, building, step, val, status, ts) {
+        if (!ctx.history[paramKey]) ctx.history[paramKey] = {};
+        if (!ctx.history[paramKey][building]) ctx.history[paramKey][building] = [];
+        const series = ctx.history[paramKey][building];
+        // The series is kept sorted by step so renderChart's polyline always runs
+        // left-to-right, even when a seek or a --loop wrap replays earlier steps.
+        // Storage stays step-keyed even when the axis is time: step is the
+        // monotonic, integral key the ordering and decimation fixes depend on.
+        const i = historyInsertionPoint(series, step);
+        const point = {
+            step, val: (val === undefined ? null : val), status: status || 'ok',
+            ts: (ts === undefined ? null : ts)
+        };
+        if (i < series.length && series[i].step === step) {
+            series[i] = point;
+        } else {
+            series.splice(i, 0, point);
+        }
+        const vk = `${paramKey}|${building}`;
+        ctx.historyVersion[vk] = (ctx.historyVersion[vk] || 0) + 1;
+    }
+
+    function clearChartHistory(key) {
+        const ctx = chartCtx(key);
+        ctx.history = {};
+        ctx.historyVersion = {};
+        ctx.decimCache.clear();
+        ctx.hoverX = null;
+        renderChart(key);
+    }
+
+    function toggleBuildingSelection(key, b) {
+        const ctx = chartCtx(key);
+        if (ctx.selected.has(b)) {
+            ctx.selected.delete(b);
+        } else {
+            if (ctx.selected.size >= MAX_CHART_SERIES) return;
+            const usedSlots = new Set(ctx.selected.values());
+            let slot = 0;
+            while (usedSlots.has(slot)) slot++;
+            ctx.selected.set(b, slot);
+        }
+        renderBuildingList(key);
+        updateChartParameterDropdown(key);
+        renderChart(key);
+    }
+
+    function renderBuildingList(key) {
+        const ctx = chartCtx(key);
+        const listEl = chartEl(ctx, 'list');
+        const query = chartEl(ctx, 'search').value.trim().toLowerCase();
+
+        const allBuildings = ctx.allBuildings();
+        if (allBuildings.length === 0) {
+            listEl.innerHTML = `<div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">${ctx.waitingHint}</div>`;
+            return;
+        }
+
+        const visible = allBuildings.filter(b => !query || b.toLowerCase().includes(query));
+        if (visible.length === 0) {
+            listEl.innerHTML = '<div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">No buildings match your search.</div>';
+            return;
+        }
+
+        const full = ctx.selected.size >= MAX_CHART_SERIES;
+        listEl.innerHTML = visible.map(b => {
+            const isSel = ctx.selected.has(b);
+            const color = isSel ? CHART_COLORS[ctx.selected.get(b)] : 'transparent';
+            const disabled = !isSel && full;
+            return `<div class="building-item ${isSel ? 'selected' : ''} ${disabled ? 'disabled' : ''}"
+                        onclick="${disabled ? '' : `toggleBuildingSelection('${key}','${b}')`}">
+                <input type="checkbox" ${isSel ? 'checked' : ''} ${disabled ? 'disabled' : ''} style="pointer-events: none; margin: 0;">
+                <span class="bui-swatch" style="background: ${color};"></span>
+                <span>${b}</span>
+            </div>`;
+        }).join('');
+    }
+
+    function buildingHasParam(b, paramKey) {
+        const [model, variable] = paramKey.split(/\/(.*)/s);
+        return dataStore[b] && dataStore[b][model] && dataStore[b][model][variable] !== undefined
+            && typeof dataStore[b][model][variable] === 'number';
+    }
+
+    function updateChartParameterDropdown(key) {
+        const ctx = chartCtx(key);
+        const select = chartEl(ctx, 'param');
+        const currentVal = select.value;
+        const sel = Array.from(ctx.selected.keys());
+
+        // Only offer parameters shared by every selected building
+        const shared = ctx.allParams().filter(p =>
+            sel.length === 0 ? true : sel.every(b => ctx.hasParam(b, p))
+        );
+
+        select.innerHTML = `<option value="">${ctx.paramPlaceholder}</option>`;
+        shared.forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p;
+            opt.innerText = p;
+            select.appendChild(opt);
+        });
+        if (shared.includes(currentVal)) select.value = currentVal;
+    }
+
+    function onChartParamChange(key) {
+        chartCtx(key).hoverX = null;
+        renderChart(key);
+    }
+
+    function niceTicks(min, max, count) {
+        if (min === max) { min -= 1; max += 1; }
+        const span = max - min;
+        const rawStep = span / Math.max(count - 1, 1);
+        const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+        let step = mag;
+        for (const m of [1, 2, 2.5, 5, 10]) {
+            if (mag * m >= rawStep) { step = mag * m; break; }
+        }
+        const ticks = [];
+        for (let t = Math.ceil(min / step) * step; t <= max + step * 1e-9; t += step) {
+            ticks.push(+t.toPrecision(12));
+        }
+        return ticks;
+    }
+
+    function fmtVal(v) {
+        if (Math.abs(v) >= 10000) return v.toExponential(2);
+        return (v % 1 !== 0) ? v.toFixed(2) : String(v);
+    }
+
+    function setChartRange(key, mode) {
+        const ctx = chartCtx(key);
+        ctx.rangeMode = mode;
+        chartEl(ctx, 'rangeAll').classList.toggle('active', mode === 'all');
+        chartEl(ctx, 'rangeRecent').classList.toggle('active', mode === 'recent');
+        ctx.hoverX = null;
+        renderChart(key);
+    }
+
+    function getChartSeries(key) {
+        const ctx = chartCtx(key);
+        const param = chartEl(ctx, 'param').value;
+        if (!param || ctx.selected.size === 0) return { param, series: [] };
+        const series = [];
+        for (const [b, slot] of ctx.selected) {
+            // Decimated at render time from the full authoritative history, so the same
+            // steps always draw the same line regardless of how they were scrubbed in.
+            const points = chartPointsFor(ctx, param, b, ctx.rangeMode);
+            series.push({ building: b, color: CHART_COLORS[slot], points });
+        }
+        return { param, series };
+    }
+
+    // Latest point that actually carries a value, for the legend and end label.
+    function lastRealPoint(points) {
+        for (let i = points.length - 1; i >= 0; i--) {
+            if (points[i].val !== null) return points[i];
+        }
+        return null;
+    }
+
+    function renderChart(key) {
+        const ctx = chartCtx(key);
+        const svg = chartEl(ctx, 'svg');
+        const emptyEl = chartEl(ctx, 'empty');
+        const legendEl = chartEl(ctx, 'legend');
+        const { param, series } = getChartSeries(key);
+        const hasData = series.some(s => s.points.some(p => p.val !== null));
+
+        // Legend (always present for the selected series; live value per building).
+        // A current dropout reads as an em dash, never as the last good number.
+        legendEl.innerHTML = series.map(s => {
+            const last = s.points[s.points.length - 1];
+            let shown = '—';
+            if (last && last.val !== null) {
+                shown = fmtVal(last.val) + (last.status === 'fault' ? ' ⚠' : '');
+            }
+            const muted = last && last.val === null ? ' title="no reading (dropout)"' : '';
+            return `<div class="legend-item"${muted}>
+                <span class="legend-key" style="background: ${s.color};"></span>
+                <span>${s.building}</span>
+                <span class="legend-val">${shown}</span>
+            </div>`;
+        }).join('');
+
+        if (!param || series.length === 0 || !hasData) {
+            svg.innerHTML = '';
+            emptyEl.style.display = 'flex';
+            if (param && series.length > 0) {
+                emptyEl.innerHTML = 'Waiting for live data on <b>&nbsp;' + param + '&nbsp;</b>...';
+            } else {
+                emptyEl.innerHTML = ctx.emptyHint;
+            }
+            chartEl(ctx, 'tooltip').style.display = 'none';
+            return;
+        }
+        emptyEl.style.display = 'none';
+
+        const wrap = chartEl(ctx, 'wrap');
+        const W = wrap.clientWidth, H = wrap.clientHeight;
+        if (W < 50 || H < 50) return;
+        const M = { top: 12, right: 70, bottom: 28, left: 56 };
+        const iw = W - M.left - M.right, ih = H - M.top - M.bottom;
+
+        // The domain the context declares: simulation steps, or real time.
+        const useTime = chartUsesTime(ctx, series);
+        const xOf = xValueOf(useTime);
+
+        let minX = Infinity, maxX = -Infinity, minVal = Infinity, maxVal = -Infinity;
+        series.forEach(s => s.points.forEach(p => {
+            const xv = xOf(p);
+            if (xv !== null) {
+                if (xv < minX) minX = xv;
+                if (xv > maxX) maxX = xv;
+            }
+            if (p.val === null) return;   // a dropout has an x position but no value
+            if (p.val < minVal) minVal = p.val;
+            if (p.val > maxVal) maxVal = p.val;
+        }));
+        if (minX === maxX) { minX -= 1; maxX += 1; }
+        if (minVal === maxVal) { minVal -= 1; maxVal += 1; }
+        const vPad = (maxVal - minVal) * 0.08;
+        minVal -= vPad; maxVal += vPad;
+
+        const x = s => M.left + ((s - minX) / (maxX - minX)) * iw;
+        const y = v => M.top + ih - ((v - minVal) / (maxVal - minVal)) * ih;
+
+        let out = '';
+
+        // Hairline gridlines + y ticks (recessive), x ticks
+        const yTicks = niceTicks(minVal, maxVal, 7);
+        yTicks.forEach(t => {
+            if (t < minVal || t > maxVal) return;
+            out += `<line x1="${M.left}" y1="${y(t)}" x2="${M.left + iw}" y2="${y(t)}" stroke="#243247" stroke-width="1"/>`;
+            out += `<text x="${M.left - 8}" y="${y(t) + 3.5}" text-anchor="end" fill="#94a3b8" font-size="11" font-family="monospace">${fmtVal(t)}</text>`;
+        });
+        const span = maxX - minX;
+        const xTicks = useTime
+            ? timeTicks(minX, maxX, timeTickStep(span, param))
+            : niceTicks(minX, maxX, 8).filter(t => t >= minX && t <= maxX && t % 1 === 0);
+        const xTickLabel = useTime ? (t => fmtAxisTime(t, span)) : (t => String(t));
+        xTicks.forEach(t => {
+            out += `<text x="${x(t)}" y="${M.top + ih + 18}" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="monospace">${xTickLabel(t)}</text>`;
+        });
+        // Baseline axis
+        out += `<line x1="${M.left}" y1="${M.top + ih}" x2="${M.left + iw}" y2="${M.top + ih}" stroke="#475569" stroke-width="1"/>`;
+        const axisTitle = useTime ? 'time' : 'step';
+        out += `<text x="${M.left + iw / 2}" y="${H - 2}" text-anchor="middle" fill="#64748b" font-size="10">${axisTitle}</text>`;
+
+        // Crosshair (behind the lines)
+        if (ctx.hoverX !== null && ctx.hoverX >= minX && ctx.hoverX <= maxX) {
+            out += `<line x1="${x(ctx.hoverX)}" y1="${M.top}" x2="${x(ctx.hoverX)}" y2="${M.top + ih}" stroke="#94a3b8" stroke-width="1"/>`;
+        }
+
+        // Series: 2px lines, round joins; end dot r=4 with 2px surface ring
+        const endLabels = [];
+        series.forEach(s => {
+            if (s.points.length === 0) return;
+
+            // A dropout lifts the pen: the next real point starts a new subpath, so
+            // the line breaks visibly instead of interpolating across missing data.
+            let d = '', penDown = false;
+            s.points.forEach(p => {
+                const xv = xOf(p);
+                if (p.val === null || xv === null) { penDown = false; return; }
+                d += `${penDown ? 'L' : 'M'}${x(xv).toFixed(1)},${y(p.val).toFixed(1)}`;
+                penDown = true;
+            });
+            if (d) {
+                out += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+            }
+
+            // Faulty readings are plotted (they are what the sensor said) but ringed
+            // in amber so they are never mistaken for trustworthy data.
+            s.points.forEach(p => {
+                const xv = xOf(p);
+                if (p.status !== 'fault' || p.val === null || xv === null) return;
+                out += `<circle cx="${x(xv).toFixed(1)}" cy="${y(p.val).toFixed(1)}" r="4.5" fill="none" stroke="${FAULT_COLOR}" stroke-width="2"/>`;
+            });
+
+            const last = lastRealPoint(s.points);
+            if (last && xOf(last) !== null) {
+                out += `<circle cx="${x(xOf(last))}" cy="${y(last.val)}" r="4" fill="${s.color}" stroke="#0f172a" stroke-width="2"/>`;
+                endLabels.push({ yPos: y(last.val), text: fmtVal(last.val) });
+            }
+
+            // Hover markers on the crosshair (nearest retained point per series)
+            if (ctx.hoverX !== null) {
+                const hp = nearestPoint(s.points, ctx.hoverX, xOf);
+                if (hp && hp.val !== null && Math.abs(xOf(hp) - ctx.hoverX) <= span * 0.02) {
+                    out += `<circle cx="${x(xOf(hp))}" cy="${y(hp.val)}" r="4" fill="${s.color}" stroke="#0f172a" stroke-width="2"/>`;
+                }
+            }
+        });
+
+        // Direct end-labels (values), only where they don't collide (<=4 series)
+        if (endLabels.length <= 4) {
+            endLabels.sort((a, b) => a.yPos - b.yPos);
+            endLabels.forEach((l, i) => {
+                if (i > 0 && l.yPos - endLabels[i - 1].yPos < 14) return;
+                out += `<text x="${M.left + iw + 8}" y="${l.yPos + 3.5}" fill="#cbd5e1" font-size="11" font-family="monospace">${l.text}</text>`;
+            });
+        }
+
+        svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+        svg.innerHTML = out;
+        renderChartTooltip(key, x, minX, maxX, useTime);
+    }
+
+    function nearestPoint(points, target, xOf) {
+        const at = xOf || (p => p.step);
+        let best = null, bd = Infinity;
+        for (const p of points) {
+            const xv = at(p);
+            if (xv === null) continue;
+            const d = Math.abs(xv - target);
+            if (d < bd) { bd = d; best = p; }
+        }
+        return best;
+    }
+
+    function renderChartTooltip(key, xScale, minX, maxX, useTime) {
+        const ctx = chartCtx(key);
+        const tt = chartEl(ctx, 'tooltip');
+        if (ctx.hoverX === null) { tt.style.display = 'none'; return; }
+        const { series } = getChartSeries(key);
+        const xOf = xValueOf(useTime);
+        const tolerance = (maxX - minX) * 0.02;
+        const rows = [];
+        series.forEach(s => {
+            const p = nearestPoint(s.points, ctx.hoverX, xOf);
+            if (p && Math.abs(xOf(p) - ctx.hoverX) <= tolerance) {
+                // Dropouts are reported as such — the tooltip is the one place a
+                // researcher checks "what was the value here?", so answering with a
+                // neighbouring number would be actively misleading.
+                const shown = p.val === null
+                    ? '<span style="color:#94a3b8;">— no reading</span>'
+                    : `<b>${fmtVal(p.val)}</b>${p.status === 'fault' ? ` <span style="color:${FAULT_COLOR};">⚠ fault</span>` : ''}`;
+                rows.push(`<div class="tt-row"><span class="tt-dot" style="background:${s.color};"></span>${s.building}: ${shown}</div>`);
+            }
+        });
+        if (rows.length === 0) { tt.style.display = 'none'; return; }
+        // A sensor tooltip answers "when", not "which step".
+        const header = useTime ? fmtFullTime(ctx.hoverX) : `Step ${ctx.hoverX}`;
+        tt.innerHTML = `<div style="color:#94a3b8; margin-bottom:3px;">${header}</div>` + rows.join('');
+        tt.style.display = 'block';
+        const wrap = chartEl(ctx, 'wrap');
+        const px = xScale(ctx.hoverX);
+        const flip = px > wrap.clientWidth - 190;
+        tt.style.left = flip ? (px - tt.offsetWidth - 14) + 'px' : (px + 14) + 'px';
+        tt.style.top = '18px';
+    }
+
+    // Both charts get the same hover behaviour from the same code.
+    Object.keys(CHART_CTX).forEach(key => {
+        const ctx = chartCtx(key);
+        const svg = chartEl(ctx, 'svg');
+        svg.addEventListener('mousemove', (e) => {
+            const { series } = getChartSeries(key);
+            const xOf = xValueOf(chartUsesTime(ctx, series));
+            const xs = new Set();
+            series.forEach(s => s.points.forEach(p => {
+                const xv = xOf(p);
+                if (xv !== null) xs.add(xv);
+            }));
+            if (xs.size === 0) return;
+            const wrap = chartEl(ctx, 'wrap');
+            const rect = wrap.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const M = { left: 56, right: 70 };
+            const iw = wrap.clientWidth - M.left - M.right;
+            let minX = Infinity, maxX = -Infinity;
+            xs.forEach(v => { if (v < minX) minX = v; if (v > maxX) maxX = v; });
+            if (minX === maxX) return;
+            const target = minX + ((mx - M.left) / iw) * (maxX - minX);
+            let nearest = null, bestDist = Infinity;
+            xs.forEach(v => {
+                const d = Math.abs(v - target);
+                if (d < bestDist) { bestDist = d; nearest = v; }
+            });
+            if (nearest !== ctx.hoverX) {
+                ctx.hoverX = nearest;
+                renderChart(key);
+            }
+        });
+        svg.addEventListener('mouseleave', () => {
+            ctx.hoverX = null;
+            renderChart(key);
+        });
+    });
+
+    window.addEventListener('resize', () => {
+        if (activeTab === 'chart') renderChart('sim');
+        if (activeTab === 'sensors') renderChart('sensor');
+    });
+</script>
+</body>
+</html>

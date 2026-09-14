@@ -1,0 +1,80 @@
+# The whole prototype in one stack: broker, replay publisher, sensor simulator,
+# and the static/proxy server for the dashboard. Driven by ./run.sh.
+#
+# Knobs (environment variables, all optional):
+#   DELAY=1.0   baseline seconds per step for the publisher (the dashboard's speed
+#               selector divides this at runtime — do not bake a fast delay in here)
+#   LOOP=1      1 = replay/sensors loop forever (default), 0 = single bounded pass
+#   SEED=       integer seed for reproducible sensor noise and faults (unset = random)
+#   SENSOR_DELAY=1.0  baseline pace of the sensor simulator, independent of DELAY
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto-broker
+    ports:
+      - "1883:1883"   # MQTT over TCP  — publisher, sensors, mosquitto_pub/sub
+      - "9001:9001"   # MQTT over WebSockets — the browser dashboard
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      # The publisher and sensors only start once the broker actually accepts
+      # connections, which is what the old `nc -z 1883` race was trying to do.
+      test: ["CMD", "mosquitto_sub", "-h", "localhost", "-p", "1883", "-t", "$$SYS/#", "-C", "1", "-W", "2"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  publisher:
+    build: .
+    image: hdf5-publisher
+    container_name: hdf5-publisher
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    # Looping is the point: telemetry is QoS 0 and unretained, so a publisher that
+    # exits after one pass leaves the dashboard with nothing arriving and nothing
+    # listening on _control/#. LOOP=0 gives a bounded one-shot run instead.
+    command: >
+      --file 20260623_baseline.hdf5
+      --host mosquitto --port 1883
+      --topic sim/coesi5
+      --delay ${DELAY:-1.0}
+      ${LOOP_FLAG---loop}
+    restart: unless-stopped
+
+  sensors:
+    image: hdf5-publisher
+    container_name: hdf5-sensors
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+      publisher:
+        condition: service_started   # shares the image; ensures it has been built
+    entrypoint: ["python3", "sensor_simulator.py"]
+    command: >
+      --file 20260623_baseline.hdf5
+      --host mosquitto --port 1883
+      --topic sensors
+      --delay ${SENSOR_DELAY:-1.0}
+      ${SENSOR_LOOP_FLAG---loop}
+      ${SEED_FLAG-}
+    restart: unless-stopped
+
+  frontend:
+    image: python:3.11-slim
+    container_name: hdf5-frontend
+    working_dir: /app
+    # Bind-mounted, not baked in: edit the HTML and reload the browser.
+    volumes:
+      - ./local_server.py:/app/local_server.py:ro
+      - ./mqtt_web_tester.html:/app/mqtt_web_tester.html:ro
+    environment:
+      # Inside the container it must listen on all interfaces; the port mapping
+      # below is what keeps the open /proxy/ endpoint off the network.
+      BIND: 0.0.0.0
+    ports:
+      - "127.0.0.1:8002:8002"
+    command: ["python3", "local_server.py"]
+    restart: unless-stopped
