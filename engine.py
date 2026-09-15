@@ -4,8 +4,10 @@ engine.py
 =========
 The simulation-engine federate.  Stand-in for the real HELICS-based engine:
 it replays an HDF5 file through `ReplayController` and publishes each step
-into the federation, and it accepts control (play/pause/speed/setpoint) from
-the bridge over a HELICS endpoint.
+into the federation at that step's simulation time, as fast as the federation
+lets it — exactly like a real model federate.  It accepts *setpoints* from
+the bridge over a HELICS endpoint; play/pause/step/pace never reach it, the
+broker's time barrier handles those for every federate at once.
 
 What a real engine replaces: this whole file.  What it keeps: the interface in
 `federation.py`.  `bridge.py`, `sensor_simulator.py` and the dashboard do not
@@ -13,7 +15,7 @@ change.
 
 Usage
 -----
-    python engine.py --file 20260623_baseline.hdf5 --delay 1.0 --loop \
+    python engine.py --file 20260623_baseline.hdf5 --loop \
         --helics-broker tcp://helics-broker:23404
 """
 
@@ -22,6 +24,7 @@ import json
 import logging
 import math
 import sys
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import helics as h
@@ -29,8 +32,8 @@ import helics as h
 from datasources import HDF5DataSource
 from datasources.hdf5_source import explore_hdf5
 from federation import (
-    DEFAULT_BROKER, DEFAULT_CORE, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP, TIME_DELTA,
-    create_federate, finalize, request_time,
+    DEFAULT_BROKER, DEFAULT_CORE, DEFAULT_PERIOD, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP,
+    create_federate, finalize,
 )
 from replay import ReplayController
 
@@ -61,6 +64,9 @@ SETPOINT_LIMITS: Dict[str, Tuple[float, float]] = {
     "Qt": (0.0, 1.0e5),             # W  — heat-pump thermal output; 0 = standby
 }
 
+#: units for the controls catalog the dashboard builds its panel from
+SETPOINT_UNITS: Dict[str, str] = {"ZoneSetPoint": "°C", "Qt": "W"}
+
 #: variable -> {coupled variable of the same entity: f(coupled_recorded, recorded, commanded)}
 COUPLINGS: Dict[str, Dict[str, Callable[[float, float, float], float]]] = {
     # The room closes 60 % of the gap between where it is and the commanded
@@ -74,6 +80,23 @@ COUPLINGS: Dict[str, Dict[str, Callable[[float, float, float], float]]] = {
     # machine, not of what it is asked to do.
     "Qt": {"En_el": lambda e, rec, cmd: (e * cmd / rec) if rec else e},
 }
+
+
+def controls_catalog(entities: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Every (entity, variable) in the file that has a limits row: what the
+    dashboard may command, with units, range and what moves with it.  A real
+    engine derives this from its scenario's declared inputs instead."""
+    out = []
+    for entity, variables in entities.items():
+        for variable in variables:
+            if variable in SETPOINT_LIMITS:
+                lo, hi = SETPOINT_LIMITS[variable]
+                out.append({
+                    "entity": entity, "variable": variable,
+                    "units": SETPOINT_UNITS.get(variable, ""), "min": lo, "max": hi,
+                    "couples": sorted(COUPLINGS.get(variable, {}).keys()),
+                })
+    return out
 
 
 def apply_control(entity: str, variable: str, hdf5_value: Any, override: Optional[float]) -> Any:
@@ -108,16 +131,20 @@ class Engine:
         self.pub_run = h.helicsFederateRegisterGlobalPublication(fed, PUB_RUN, h.HELICS_DATA_TYPE_STRING, "")
         self.pub_step = h.helicsFederateRegisterGlobalPublication(fed, PUB_STEP, h.HELICS_DATA_TYPE_STRING, "")
         self.endpoint = h.helicsFederateRegisterGlobalEndpoint(fed, EP_ENGINE, "")
-        self.time = 0.0
+        self.period = controller.dt_seconds or DEFAULT_PERIOD
+        self.time = 0.0            # HELICS time = simulation seconds, monotonic across passes
         self.overrides: Dict[Tuple[str, str], float] = {}
-        controller.on_tick = self.tick
 
     # -- federation clock ------------------------------------------------------
 
-    def tick(self) -> None:
-        """Advance the federation by one slice and act on anything the bridge sent.
-        Called from the controller's wait loop, playing or paused."""
-        self.time = request_time(self.fed, self.time + TIME_DELTA, "engine")
+    def advance(self) -> None:
+        """Ask for the next step's simulation time.  Blocks for as long as the
+        broker's barrier says so — that *is* pause and pace — then acts on
+        anything the bridge sent in the meantime."""
+        self.time = h.helicsFederateRequestTime(self.fed, self.time + self.period)
+        self._drain()
+
+    def _drain(self) -> None:
         while h.helicsEndpointHasMessage(self.endpoint):
             msg = h.helicsEndpointGetMessage(self.endpoint)
             self._dispatch(h.helicsMessageGetString(msg))
@@ -133,36 +160,11 @@ class Engine:
         if not isinstance(cmd, dict):
             return
         command = cmd.get("command")
-        if command == "play":
-            self.controller.play()
-            log.info("Control: play (from step %d)", self.controller.current_step)
-            self._send_state()
-        elif command == "pause":
-            self.controller.pause()
-            log.info("Control: pause (at step %d)", self.controller.current_step)
-            self._send_state()
-        elif command == "speed":
-            if "multiplier" in cmd:
-                self.controller.set_speed(cmd["multiplier"])
-                log.info("Control: speed x%s", cmd["multiplier"])
-                self._send_state()
-            else:
-                log.warning("Control: speed without a 'multiplier' field: %r", raw)
-        elif command == "setpoint":
+        if command == "setpoint":
             self._setpoint(cmd)
         else:
+            # play/pause/step/pace are the broker's; an engine never sees them.
             log.warning("Control: unknown command %r", command)
-
-    def _send_state(self) -> None:
-        """Transport state as the engine holds it — what the dashboard renders,
-        instead of guessing from its own last click."""
-        state = {
-            "command": "state",
-            "playing": not self.controller.paused,
-            "speed": self.controller.speed,
-            "step": self.controller.current_step,
-        }
-        h.helicsEndpointSendBytesTo(self.endpoint, json.dumps(state).encode(), EP_BRIDGE)
 
     def _setpoint(self, cmd: Dict[str, Any]) -> None:
         entity, variable = cmd.get("entity"), cmd.get("variable")
@@ -207,31 +209,38 @@ class Engine:
         h.helicsFederateEnterExecutingMode(self.fed)
         h.helicsPublicationPublishString(
             self.pub_run,
-            json.dumps({"metadata": self.controller.get_run_metadata(), "catalog": catalog}, allow_nan=False),
+            json.dumps({"metadata": self.controller.get_run_metadata(), "catalog": catalog,
+                        "controls": controls_catalog(entities)}, allow_nan=False),
         )
         log.info("Published run metadata + catalog (%d datasets) to '%s'", n_datasets, PUB_RUN)
-        self._send_state()
 
         n_steps = self.source.get_step_count()
-        log.info(
-            "Starting replay: %d time steps across %d datasets (delay=%.3fs)",
-            self.controller.end_step - self.controller.start_step + 1, n_datasets, self.controller.delay,
-        )
+        log.info("Starting replay: %d time steps across %d datasets, period %.0f s, %s",
+                 self.controller.end_step - self.controller.start_step + 1, n_datasets, self.period,
+                 "looping" if self.controller.loop else "single pass")
         published = 0
+        first = True
         for step, step_values in self.controller.steps():
+            # Step 0 goes out at t=0 (the executing-mode entry time); every
+            # later step waits for its own simulation time to be granted.
+            if not first:
+                self.advance()
+            first = False
             apply_overrides(step_values, self.overrides)
             h.helicsPublicationPublishString(
-                self.pub_step, json.dumps({"step": step, "values": step_values}, allow_nan=False)
+                self.pub_step,
+                json.dumps({"step": step, "pass": self.controller.current_pass, "values": step_values},
+                           allow_nan=False),
             )
             published += 1
-            log.info("Published step %d / %d  (%.1f%%) at t=%.2f%s",
+            log.info("Published step %d / %d  (%.1f%%) at sim t=%.0f s%s",
                      step + 1, n_steps, 100.0 * (step + 1) / n_steps, self.time,
                      f"  [{len(self.overrides)} override(s)]" if self.overrides else "")
         # Tell the bridge we are leaving, then one more grant so it is
         # guaranteed to see both the final step and the farewell before this
         # federate is gone.
         h.helicsEndpointSendBytesTo(self.endpoint, json.dumps({"command": "bye"}).encode(), EP_BRIDGE)
-        self.tick()
+        self.advance()
         log.info("All %d steps published.", published)
         return 0
 
@@ -250,8 +259,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--explore", action="store_true", help="Print all datasets in the HDF5 file and exit.")
     parser.add_argument("--helics-broker", default=DEFAULT_BROKER, metavar="ADDR", help="HELICS broker address.")
     parser.add_argument("--helics-core", default=DEFAULT_CORE, metavar="TYPE", help="HELICS core type.")
-    parser.add_argument("--delay", type=float, default=1.0, metavar="SECONDS",
-                        help="Baseline delay in seconds between published time steps.")
+    parser.add_argument("--sim-start", default=None, metavar="ISO8601",
+                        help="Calendar instant of simulation time 0 (default: today at local midnight).")
     parser.add_argument("--start-step", type=int, default=0, metavar="STEP", help="First step to replay.")
     parser.add_argument("--end-step", type=int, default=None, metavar="STEP",
                         help="Last step to replay (default: the last step in the file).")
@@ -275,11 +284,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.error("No valid 1D time-series datasets found in the HDF5 file.")
         return 1
 
+    sim_start = None
+    if args.sim_start:
+        try:
+            sim_start = datetime.fromisoformat(args.sim_start)
+            if sim_start.tzinfo is None:
+                sim_start = sim_start.astimezone()
+        except ValueError:
+            log.error("--sim-start must be ISO 8601, got %r", args.sim_start)
+            return 1
     controller = ReplayController(
-        source=source, delay=args.delay, start_step=args.start_step,
-        end_step=args.end_step, loop=args.loop,
+        source=source, start_step=args.start_step, end_step=args.end_step,
+        loop=args.loop, sim_start=sim_start,
     )
-    fed = create_federate("engine", args.helics_broker, args.helics_core)
+    fed = create_federate("engine", args.helics_broker, controller.dt_seconds or DEFAULT_PERIOD,
+                          args.helics_core)
     engine = Engine(source, controller, fed)
     try:
         return engine.run()

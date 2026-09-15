@@ -1,9 +1,9 @@
 # Live Simulation Viewer
 
-Replay a district building-energy simulation as if it were a live co-simulation, and
-inspect it in the browser — pause, change speed, push a setpoint into the engine and
-watch the line move, see buildings light up on a 3D map — with a synthetic sensor network
-running alongside the ground truth.
+Replay a district building-energy simulation as a live co-simulation, and inspect it in
+the browser — pause, step, set the pace, push a setpoint into the engine and watch the
+line move, see buildings light up on a 3D map — with a synthetic sensor network running
+alongside the ground truth.
 
 The input is a single HDF5 file produced by the COESI/UrbanSim simulation engine
 (`20260623_baseline.hdf5`: 289 time series over 41 entities, 4 320 steps at 600 s
@@ -14,8 +14,11 @@ subscribes to it all and renders a heat-map table, a live chart, a sensor view a
 3D map.
 
 The HDF5 replay is a stand-in. The engine/bridge split exists so that the real
-HELICS-based simulation engine, when it arrives, replaces exactly one federate —
-`engine.py` — and nothing else changes.
+HELICS-based simulation engine (CosimGym-style: every model a federate, HELICS time =
+simulation time, running as fast as it computes) replaces exactly one federate —
+`engine.py` — and nothing else changes. That is also why **play, pause, step and pace
+are done by the HELICS broker with a time barrier**, not by the engine: they work on any
+federation without touching a model.
 
 This is a **research tool, not a monitoring product**: there is no database, no
 server-side state, no build step and no test suite. The design priorities, in order, are
@@ -29,16 +32,16 @@ is acknowledged with what was actually applied) and a swappable engine and data 
 ```mermaid
 flowchart LR
     subgraph data["Data"]
-        H5[("20260623_baseline.hdf5<br/>289 series · 4320 steps")]
+        H5[("20260623_baseline.hdf5<br/>289 series · 4320 steps · 600 s")]
     end
 
     subgraph fed["HELICS federation — Docker Compose"]
         direction TB
         DS["datasources/<br/>HDF5DataSource<br/><i>only module importing h5py</i>"]
-        RC["replay/<br/>ReplayController<br/>pacing · play/pause/speed · on_tick"]
-        ENG["engine.py — engine federate<br/>replay · apply_control · acks"]
-        HB(("helics_broker.py<br/>zmq :23404"))
-        BRG["bridge.py — bridge federate<br/>zero-filter · payload · _control/*"]
+        RC["replay/<br/>ReplayController<br/>which steps, provenance"]
+        ENG["engine.py — engine federate<br/>request_time(t + 600 s) · apply_control · acks"]
+        HB(("helics_broker.py<br/>broker + run control<br/><b>time barrier</b>"))
+        BRG["bridge.py — bridge federate<br/>zero-filter · payload · setpoints in"]
     end
 
     subgraph mq["MQTT — Docker Compose"]
@@ -48,7 +51,7 @@ flowchart LR
     end
 
     subgraph browser["Browser"]
-        UI["mqtt_web_tester.html<br/>Data Table · Live Chart · Sensors · 3D Map"]
+        UI["mqtt_web_tester.html<br/>Data Table · Live Chart + Setpoints · Sensors · 3D Map"]
     end
 
     API[("UrbanSim API<br/>building GeoJSON")]
@@ -57,80 +60,92 @@ flowchart LR
     DS --> RC --> ENG
     H5 --> SEN
     ENG -- "engine/run (once)<br/>engine/step (per step)" --> HB --> BRG
-    BRG -- "play · pause · speed · setpoint" --> HB -.-> ENG
+    HB -. "barrier holds every federate" .-> ENG
+    BRG -- "setpoint" --> HB -.-> ENG
     ENG -. "setpoint_ack · bye" .-> HB
-    BRG -- "sim/coesi5/&lt;entity&gt;/&lt;var&gt;<br/>_meta/run · _control/setpoint/…/ack (retained)" --> BR
-    SEN -- "sensors/&lt;building&gt;/&lt;type&gt;<br/>sensors/_meta/sensors (retained)" --> BR
+    BRG -- "sim/coesi5/&lt;entity&gt;/&lt;var&gt;<br/>_meta/run · _meta/progress · _meta/controls<br/>_control/setpoint/…/ack (all retained)" --> BR
+    HB -- "_meta/state (retained)" --> BR
+    BR -- "_control/play · pause · step · pace" --> HB
+    BR -- "_control/setpoint/…" --> BRG
+    SEN -- "sensors/&lt;building&gt;/&lt;type&gt;" --> BR
     BR -- "WebSocket 9001" --> UI
-    UI -- "sim/coesi5/_control/*" --> BR -- "_control/#" --> BRG
+    UI -- "sim/coesi5/_control/*" --> BR
     SRV -- "http://localhost:8002" --> UI
     UI -- "/proxy/…" --> SRV --> API
 ```
+
 
 Six containers, one entry point (`./run.sh up`):
 
 | service | what it is | why it exists |
 |---|---|---|
 | `mosquitto` | Eclipse Mosquitto with two listeners | Browsers speak MQTT only over WebSockets (9001); Python clients use TCP (1883) |
-| `helics-broker` | `helics_broker.py` | The HELICS broker the two federates meet at; health-checked; recycles after every federation |
-| `engine` | `engine.py` | The engine federate: replays the file through `ReplayController`, applies setpoints, acknowledges them |
-| `bridge` | `bridge.py` (same image) | The bridge federate: turns each HELICS step into ~175 MQTT topics, turns `_control/*` back into HELICS messages |
+| `helics-broker` | `helics_broker.py` | The HELICS broker **and the run control**: play/pause/step/pace over MQTT, done with a time barrier on the whole federation; health-checked; recycles after every federation |
+| `engine` | `engine.py` | The engine federate: publishes each step at its simulation time, as fast as the broker lets it; applies setpoints and acknowledges them |
+| `bridge` | `bridge.py` (same image) | The bridge federate: turns each HELICS step into ~175 MQTT topics plus retained `_meta/*`, turns `_control/setpoint/*` into HELICS messages |
 | `sensors` | `sensor_simulator.py` (same image) | A believable sensor network derived from the same file, on its own cadence, no control channel |
 | `frontend` | `local_server.py` | Serves the dashboard and strips CORS from the UrbanSim GeoJSON API |
 
 Dependency direction in the Python is strict — `datasources/ → replay/ → engine.py`, and
 `federation.py → {engine.py, bridge.py}`. `datasources/hdf5_source.py` is the only module
 that imports `h5py` (a data-source swap touches one construction site); `replay/` imports
-neither `paho.mqtt` nor `helics` (it is pure pacing); `bridge.py` imports neither
-`datasources/` nor `replay/` (everything it publishes arrived over HELICS). That last
-line is the migration guarantee: **`federation.py` is the interface the real engine has to
-speak, and `bridge.py`, the sensors and the dashboard do not change when it does.**
+neither `paho.mqtt` nor `helics` (it only picks steps and writes provenance); `bridge.py`
+imports neither `datasources/` nor `replay/` (everything it publishes arrived over HELICS).
+That last line is the migration guarantee: **`federation.py` is the interface the real
+engine has to speak, and `bridge.py`, the broker's run control, the sensors and the
+dashboard do not change when it does.**
 
 ## How a step flows
 
 ```mermaid
 sequenceDiagram
     autonumber
+    participant K as Broker (run control)
     participant E as Engine (federate)
     participant P as Bridge (federate)
     participant B as Mosquitto
     participant D as Dashboard
 
-    Note over E,P: on start — HELICS engine/run, once
-    E->>P: {metadata, catalog}
-    P->>B: sim/coesi5/_meta/run — retained, QoS 1
-    B-->>D: delivered immediately to any late subscriber
+    Note over K: barrier set before anyone joins: nothing runs ahead
+    E->>P: HELICS engine/run {metadata, catalog, controls}
+    P->>B: _meta/run · _meta/controls — retained
+    K->>B: _meta/state {mode, pace} — retained
 
-    loop every 50 ms tick, playing or paused
-        E->>E: request_time(t + Δ); drain control endpoint
-        P->>P: request_time(t + Δ); read new step if any; send queued commands
+    loop every step — as fast as the barrier allows
+        E->>K: request_time(t + 600 s)
+        K-->>E: granted when the barrier has passed t + 600
+        E->>P: HELICS engine/step {step, pass, values}
+        P->>P: latching zero filter
+        P->>B: ~175 × sim/coesi5/entity/var {step, total_steps, dataset, attributes, values}
+        P->>B: _meta/progress {step, pass, sim_time} — retained
+        B-->>D: table, chart, map repaint once; progress shows the simulated date
     end
 
-    loop every step (delay ÷ speed)
-        E->>E: ReplayController yields (step, values); apply_overrides
-        E->>P: HELICS engine/step {step, values}
-        P->>P: latching zero filter — suppress a series only until its first non-zero
-        P->>B: ~175 × PUBLISH sim/coesi5/entity/var {step, total_steps, dataset, attributes, values}
-        B-->>D: ~175 JSON messages
-        D->>D: update dataStore · maxima · chart history (sorted by step)
-        D->>D: one paint per animation frame → table, chart, map, transport bar
-    end
+    Note over D,K: pause · step · pace
+    D->>B: _control/pause
+    B-->>K: barrier frozen at the federates' current time
+    D->>B: _control/step
+    B-->>K: barrier moved by one period → exactly one more step
+    D->>B: _control/pace {"sim_seconds_per_second": 3600}
+    B-->>K: barrier advances 3600 sim-s per real second
 
-    Note over D,E: user applies a setpoint (Live Chart sidebar) or presses pause
-    D->>B: sim/coesi5/_control/setpoint/<entity>/Qt {"value": 0}
-    B-->>P: _control/# subscription → queue
-    P->>E: HELICS {"command": "setpoint", entity, variable, value}
+    Note over D,E: setpoint
+    D->>B: _control/setpoint/<entity>/Qt {"value": 0}
+    B-->>P: setpoint listener → queue
+    P->>E: HELICS {"command": "setpoint", …}  (delivered at the next grant)
     E->>E: validate · clamp · store override — next step publishes it
     E->>P: HELICS {"command": "setpoint_ack", applied, accepted, reason, step}
-    P->>B: …/Qt/ack — retained, QoS 1
-    B-->>D: panel shows "applied 0 at step n" (and so does a page opened later)
+    P->>B: …/Qt/ack — retained
+    B-->>D: panel shows "applied 0 at step n"
 ```
 
-Two things in that diagram are deliberate. HELICS time keeps ticking while the replay is
-paused — otherwise a `play` could never reach a paused engine, because the bridge would be
-blocked waiting for the engine to advance. And there is **no seek**: a federation's clock
-only runs forward, so the scrubber is a read-only progress bar. That is a regression
-against "pause, scrub and re-watch" taken knowingly for this pass.
+
+Two things in that diagram are deliberate. The engine has **no pacing code at all**: it
+asks for the next step's time and publishes when granted, which is what a real model
+federate does; pause and pace exist only as the broker's barrier. And there is **no seek**:
+a federation's clock only runs forward, so the progress bar is read-only and **Step** (one
+step at a time while paused) is the honest replacement for scrubbing. Browsing history
+properly needs the run's stored results (InfluxDB) — see *Known limitations*.
 
 The sensor simulator runs its own read loop independently — **it has no control
 channel**, so it keeps reporting at each sensor type's own interval while the replay is
@@ -167,10 +182,12 @@ Knobs, all optional, all environment variables:
 
 | knob | default | effect |
 |---|---|---|
-| `DELAY` | `1.0` | Baseline seconds per replayed step. The dashboard's speed selector *divides* this at runtime, so leave it watchable |
-| `LOOP` | `1` | `LOOP=0 ./run.sh up` replays once and stops instead of wrapping to step 0 forever |
+| `PACE` | `600` | Initial pace in **simulated seconds per real second** (600 = one 10-minute step per second). `0` = free-run. Changed live from the dashboard |
+| `PERIOD` | `600` | Simulated seconds per step — the file's dt. Broker and bridge must agree with the engine |
+| `LOOP` | `1` | `LOOP=0 ./run.sh up` replays once; the run then reads *finished* and the federation dissolves |
 | `SEED` | random | `SEED=42 ./run.sh up` makes sensor noise, dropouts and faults reproducible |
-| `SENSOR_DELAY` | `1.0` | Baseline pace of the sensor simulator, independent of `DELAY` |
+| `SENSOR_DELAY` | `1.0` | Baseline pace of the sensor simulator, independent of `PACE` |
+| `SIM_START` | today, local midnight | Calendar instant of simulation time 0 (ISO 8601). Progress and the Live Chart axis are dated from it |
 
 Looping is on by default for a reason: telemetry is QoS 0 and unretained, so an engine
 that exits after one pass dissolves the federation and leaves the dashboard with nothing
@@ -180,11 +197,16 @@ the HELICS broker recycles itself and waits for the next pair.
 
 ## Using the dashboard
 
-**Transport bar** (top): play/pause, a read-only progress bar over all 4 320 steps, and a
-speed selector. Play/pause/speed publish to `sim/coesi5/_control/*` and drive the
-*engine* through the bridge, so every connected browser sees the same replay. The `run:`
-badge shows which file produced what you are looking at, with the full provenance record
-on hover.
+**Run control** (top): ▶/❚❚ play–pause, ⏭ **step** (exactly one step, while paused), a
+read-only progress bar with the **simulated date** and percentage, a **pace** selector
+(real time · 1 min/s · 10 min/s · 1 h/s · 6 h/s · 1 day/s · free-run) and the **actual
+rate** the engine is achieving. These publish to `sim/coesi5/_control/*` and are answered
+by the HELICS broker, which holds the whole federation with a time barrier — so every
+connected browser sees the same run, and a reloaded page shows the true state (it is
+retained on `_meta/state`). Pace can only slow a run down; nothing makes the engine compute
+faster, which is why the actual rate is shown next to the requested one. The `run:` badge
+shows which file produced what you are looking at and the dated span it covers, with the
+full provenance record on hover.
 
 **Data Table** — rows are buildings, column groups are model entities, cells are
 colour-coded by magnitude (red positive, blue negative). Columns appear as series become
@@ -193,18 +215,20 @@ drawer at the bottom shows the raw message log.
 
 **Live Chart** — pick up to 8 buildings and a shared parameter; the series build as steps
 arrive, with a crosshair tooltip and a full-timeline or last-400-steps range. The x-axis
-is simulation *steps*. A loop wrap redraws in place — points are stored sorted by step,
-never appended.
+is **simulated calendar time** (`start_time + step × dt` from `_meta/run`); storage stays
+keyed by step. A new pass (or, with a real engine, a new RL episode) starts the chart
+over instead of overwriting the previous one point by point.
 
-The sidebar's **Setpoint → engine** panel is the two-way loop: pick a building and a
-target — *Zone setpoint (°C)* or *Heat-pump heat output (W)* — type a value, **Apply**.
-The engine substitutes it for the recorded value from the next step on and moves a
-coupled variable with it (`TBuilding` follows the zone setpoint; `En_el` scales with heat
-output, so `0` parks the pump). The status line shows only what the engine *acknowledged*:
-`applied 26 at step 153`, `clamped to [10, 30]`, `rejected: unknown entity/variable`, or
-`no override` after **Clear**. Acks are retained, so a reloaded page shows the true state
-before any telemetry arrives. Try `bui_0027_0` + heat output `0` while charting `Qt` or
-`En_el`.
+The sidebar's **Setpoint → engine** panel is the two-way loop. Its buildings and inputs
+come from the engine's retained **controls catalog** (`_meta/controls`: entity, variable,
+units, min/max, and which variables move with it) — nothing is hard-coded in the page.
+Pick a building and an input, type a value, **Apply**. The engine substitutes it for the
+recorded value from the next step on and moves the coupled variable (`TBuilding` follows
+`ZoneSetPoint`; `En_el` scales with `Qt`, so `0` parks the pump). The status line shows
+only what the engine *acknowledged*: `applied 26 at step 153`, `clamped to [10, 30]`,
+`rejected: …`, or `no override` after **Clear**. Acks are retained, so a reloaded page
+shows the true state before any telemetry arrives. A setpoint sent while paused is applied
+on the next step after play.
 
 **Sensors** — the same chart and table machinery pointed at the `sensors/#` stream. The
 x-axis is *real time* (each reading carries a timestamp), ticks land only on instants a
@@ -222,12 +246,15 @@ Broker host, port and base topic live behind the **Config** drop-down.
 
 ## Driving the replay from a terminal
 
-Anything that can publish MQTT can drive the transport or push a setpoint:
+Anything that can publish MQTT can drive the run or push a setpoint:
 
 ```bash
 mosquitto_pub -t sim/coesi5/_control/pause -m ''
-mosquitto_pub -t sim/coesi5/_control/speed -m '{"multiplier": 4.0}'
+mosquitto_pub -t sim/coesi5/_control/step  -m ''                                  # one step, while paused
+mosquitto_pub -t sim/coesi5/_control/pace  -m '{"sim_seconds_per_second": 3600}'  # 1 simulated hour per second; 0 = free-run
 mosquitto_pub -t sim/coesi5/_control/play  -m ''
+mosquitto_sub -t sim/coesi5/_meta/state -C 1                                      # retained: {mode, pace, allowed_sim_time, period}
+mosquitto_sub -t sim/coesi5/_meta/progress -C 1                                   # retained: {step, pass, sim_time, total_steps, finished}
 
 E=heating_frassinetto_hp2_proc_0-0.heating_frassinetto_hp2_bui_0027_0
 mosquitto_pub -t sim/coesi5/_control/setpoint/$E/Qt -m '{"value": 0}'          # park the heat pump
@@ -265,22 +292,25 @@ Reserved sub-namespaces under the same base topic:
 
 | topic | direction | notes |
 |---|---|---|
-| `_meta/run` | bridge → world | run provenance; retained, QoS 1 |
-| `_control/play`, `_control/pause` | world → engine | empty payload |
-| `_control/speed` | world → engine | `{"multiplier": 4.0}` |
-| `_control/setpoint/<entity>/<variable>` | world → engine | `{"value": 26}`; empty or `{"value": null}` clears |
+| `_meta/run` | bridge → world | run provenance incl. `start_time`, `end_time`, `dt_seconds`; retained, QoS 1 |
+| `_meta/state` | broker → world | `{mode: paced\|free\|paused, pace, allowed_sim_time, period, at}`; retained |
+| `_meta/progress` | bridge → world | `{step, pass, sim_time, total_steps, finished, at}`; retained |
+| `_meta/controls` | bridge → world | `[{entity, variable, units, min, max, couples}]`; retained |
+| `_control/play`, `_control/pause`, `_control/step` | world → broker | empty payload |
+| `_control/pace` | world → broker | `{"sim_seconds_per_second": 3600}`; `0` = free-run |
+| `_control/setpoint/<entity>/<variable>` | world → engine (via bridge) | `{"value": 26}`; empty or `{"value": null}` clears |
 | `_control/setpoint/<entity>/<variable>/ack` | engine → world | `{entity, variable, requested, applied, accepted, reason, step, at}`; retained, QoS 1 |
 
-There is no `_control/seek`. New behaviour goes on new reserved topics — the telemetry
-payload shape is fixed, which is also why there is no `sim_time` field: it is
-`step × dt_seconds`, and `dt_seconds` is in `_meta/run`.
+There is no `_control/seek` and no `_control/speed`. New behaviour goes on new reserved
+topics — the telemetry payload shape is fixed, which is also why there is no `sim_time`
+field in it: it is `start_time + step × dt_seconds`, both in `_meta/run`.
 
 Between the two federates the contract is `federation.py`: one string publication
-`engine/run` (metadata + attribute catalog, once), one string publication `engine/step`
-(`{"step", "values": {entity: {variable: value}}}`, per step), and two endpoints
-(`engine/control` for commands in, `bridge/control` for acks and a farewell `bye` out).
-HELICS time is the engine's wall clock, advanced in 50 ms slices whether playing or
-paused; simulation time is derived from the step.
+`engine/run` (metadata + attribute catalog + controls, once), one string publication
+`engine/step` (`{"step", "pass", "values": {entity: {variable: value}}}`, per step), and
+two endpoints (`engine/control` for setpoints in, `bridge/control` for acks and a farewell
+`bye` out). **HELICS time is simulation time**: the engine requests `t + period` per step
+and never sleeps. The broker's time barrier is the only thing that ever holds it back.
 
 Sensor readings live on `sensors/<building>/<type>` and always carry
 `status: "ok" | "dropout" | "fault"`. A dropout has `value: null` — never `0`, never a
@@ -300,13 +330,13 @@ run.sh                      one entry point: up / down / restart / status / logs
 docker-compose.yml          mosquitto + helics-broker (health-checked) → engine, bridge, sensors, frontend
 Dockerfile                  one image for engine / bridge / helics-broker / sensors, deps pinned via requirements.txt
 federation.py               the HELICS contract: publication + endpoint names, payload shapes, clock
-engine.py                   engine federate — HDF5 replay, apply_control (the seam the real physics replaces), acks
-bridge.py                   bridge federate — HELICS → MQTT telemetry (zero filter, payload), MQTT _control/* → HELICS
-helics_broker.py            HELICS broker with a readiness sentinel; recycles per federation
+engine.py                   engine federate — HDF5 replay at simulation time, apply_control (the seam the real physics replaces), acks
+bridge.py                   bridge federate — HELICS → MQTT telemetry + retained _meta/*, MQTT setpoints → HELICS
+helics_broker.py            HELICS broker + run control: play/pause/step/pace as a time barrier; recycles per federation
 sensor_simulator.py         synthetic sensor stream — own CLI, own client, own pacing
 datasources/base.py         SimulationDataSource — the swappable source contract
 datasources/hdf5_source.py  HDF5DataSource — the only module that imports h5py
-replay/controller.py        ReplayController — pacing, play/pause/speed, on_tick hook, provenance
+replay/controller.py        ReplayController — which steps in what order, passes, dated provenance (no pacing)
 mqtt_web_tester.html        the entire frontend, no framework, no build step
 mqtt_tester.py              terminal subscriber (Rich TUI)
 local_server.py             static server + /proxy/ CORS stripper for the GeoJSON API
@@ -329,7 +359,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # once
 
 (The HELICS broker runs on the host in dev mode rather than in Docker: a ZMQ core needs
 the broker to connect *back* to each federate, which a broker inside Docker Desktop's VM
-cannot reliably do to processes on the Mac.)
+cannot reliably do to processes on the Mac. Dev mode starts at `PACE=2000`.)
 
 The dashboard is bind-mounted into its container, so editing `mqtt_web_tester.html` only
 needs a browser reload.
@@ -353,23 +383,25 @@ retained metadata, sensor realism and the chart's ordering/decimation invariants
 - **Local-machine trust model.** The broker allows anonymous connections and
   `_control/*` is a write path; the `/proxy/` endpoint fetches any URL. The proxy is
   loopback-only, but do not run this stack on an untrusted network.
-- **No seek.** Removed with the HELICS split — a federation's clock cannot run backwards.
-  The scrubber is read-only. Bringing scrubbing back means a checkpoint/restore design
-  done together with the real engine, not bolted onto the stand-in.
-- **Transport state is optimistic.** Setpoints are acknowledged, play/pause/speed are
-  not: a page opened while the replay is paused assumes it is playing until the next
-  message disagrees. A retained `_meta/state` on every transition would make it
-  authoritative.
-- **The federation is static and heals in ~30 s.** Exactly two federates, no late joining.
-  If the engine or bridge crashes, the other exits after HELICS's lost-comms timeout and
-  Docker restarts both. A restarted engine starts with no overrides while the last
-  retained acks still say "applied" — re-apply from the dashboard, or see the
-  re-announce-on-start item in ARCHITECTURE §16.
-- **HELICS time is the engine's wall clock**, not simulation time — that is what lets a
-  paused engine still receive `play`. The real engine will make it the simulation clock.
+- **No seek, and no history yet.** A federation's clock cannot run backwards, so the
+  progress bar is read-only and *Step* is the precise tool instead. Browsing earlier
+  moments properly means reading the run's stored results — the real engine writes
+  every step to InfluxDB — through a "History" mode on the chart and table. That needs
+  the store to exist in this stack first; it is the next item.
+- **One step blob over HELICS, not one publication per variable.** The real engine
+  publishes each variable separately (`building_federate.0/T_indoor`, typed, with units);
+  the bridge will register those subscriptions from the scenario YAML. Its publishing
+  code does not change — only where `values` come from.
+- **The federation is static and heals in ~10 s.** Exactly two federates, no late joining.
+  If the engine or bridge dies, the broker notices, tears the federation down and Docker
+  restarts both. A restarted engine starts with no overrides while the last retained acks
+  still say "applied" — re-apply from the dashboard.
 - **`apply_control` is a legible stand-in**, not physics: it substitutes the commanded
   value and moves one coupled variable predictably. It exists so a dashboard action
   changes a chart line within one step.
+- **Pace only slows.** The barrier can hold a federation back; it cannot make a slow model
+  step faster. The dashboard shows the actual rate next to the requested one for that
+  reason.
 - **No retained telemetry snapshot.** A browser connecting mid-run fills in progressively
   rather than instantly.
 - **Chart and table are hand-rolled SVG/DOM.** They are correct and parameterised for both

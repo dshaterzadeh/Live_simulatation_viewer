@@ -15,4 +15,4 @@ COPY 20260623_baseline.hdf5 ./
 # One image, four entrypoints: docker-compose.yml runs this default for the
 # `engine` service and overrides it for `bridge`, `helics-broker` and `sensors`.
 ENTRYPOINT ["python3", "engine.py"]
-CMD ["--file", "20260623_baseline.hdf5", "--helics-broker", "tcp://helics-broker:23404", "--delay", "1.0", "--loop"]
+CMD ["--file", "20260623_baseline.hdf5", "--helics-broker", "tcp://helics-broker:23404", "--loop"]

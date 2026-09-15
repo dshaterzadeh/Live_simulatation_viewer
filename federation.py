@@ -10,41 +10,38 @@ neither federate hard-codes the other's details.
 Publications (engine -> bridge), both JSON strings:
 
     PUB_RUN   once, at start:   {"metadata": {...run provenance...},
-                                 "catalog":  {entity: {variable: attributes}}}
-    PUB_STEP  once per step:    {"step": int, "values": {entity: {variable: value}}}
+                                 "catalog":  {entity: {variable: attributes}},
+                                 "controls": [{entity, variable, units, min, max, couples}]}
+    PUB_STEP  once per step:    {"step": int, "pass": int,
+                                 "values": {entity: {variable: value}}}
 
 Endpoints (messages, JSON strings):
 
-    EP_ENGINE  bridge -> engine   {"command": "play" | "pause"}
-                                  {"command": "speed", "multiplier": float}
-                                  {"command": "setpoint", "entity": str,
+    EP_ENGINE  bridge -> engine   {"command": "setpoint", "entity": str,
                                    "variable": str, "value": number | null}
     EP_BRIDGE  engine -> bridge   {"command": "setpoint_ack", "entity", "variable",
                                    "requested", "applied", "accepted", "reason", "step"}
-                                  {"command": "state", "playing": bool, "speed": float,
-                                   "step": int}     at start and on every play/pause/speed
                                   {"command": "bye"}   sent once, before the engine leaves
 
-Clock: HELICS time is advanced by the engine in TIME_DELTA slices from its own
-wall clock — it keeps running while the replay is paused, which is what lets a
-`play` message reach a paused engine at all.  Simulation time is *not* HELICS
-time here; it is `step * dt_seconds` with `dt_seconds` taken from the run
-metadata.  A real engine will make HELICS time the simulation clock; the bridge
-does not care which, it only reads what arrives at each grant.
+Clock: HELICS time **is simulation time**, in seconds.  The engine requests
+`t + period` for every step and publishes when granted; it never sleeps.
+Play, pause, step and pace are not the engine's business at all — the broker
+(`helics_broker.py`) holds the whole federation back with a time barrier.
+A real engine (CosimGym-style, `request_time(granted + period)`, as fast as it
+computes) therefore needs nothing added to be driven from the dashboard.
 """
 
 import json
 import logging
-import os
-import time
 from typing import Any, List
 
 import helics as h
 
 log = logging.getLogger("hdf5_mqtt_publisher")
 
-#: HELICS seconds per engine tick — also the bridge's request granularity
-TIME_DELTA = 0.05
+#: Simulation seconds per step, used only as a default; the engine takes it
+#: from the source and the bridge/broker from --period.
+DEFAULT_PERIOD = 600.0
 
 PUB_RUN = "engine/run"
 PUB_STEP = "engine/step"
@@ -54,41 +51,22 @@ EP_BRIDGE = "bridge/control"
 DEFAULT_BROKER = "tcp://localhost:23404"
 DEFAULT_CORE = "zmq"
 
-#: A time request that is not granted within this many seconds means the other
-#: federate is gone and the broker has not noticed: the federation is wedged.
-GRANT_TIMEOUT = 20.0
 
-
-def create_federate(name: str, broker_address: str, core_type: str = DEFAULT_CORE) -> Any:
-    """A combination federate (values + messages) joined to the shared broker."""
+def create_federate(name: str, broker_address: str, period: float, core_type: str = DEFAULT_CORE) -> Any:
+    """A combination federate (values + messages) joined to the shared broker,
+    stepping on a `period` grid so grants land on whole steps."""
     info = h.helicsCreateFederateInfo()
     h.helicsFederateInfoSetCoreTypeFromString(info, core_type)
     h.helicsFederateInfoSetCoreInitString(
         info, f"--federates=1 --broker_address={broker_address}"
     )
-    h.helicsFederateInfoSetTimeProperty(info, h.HELICS_PROPERTY_TIME_DELTA, TIME_DELTA)
+    h.helicsFederateInfoSetTimeProperty(info, h.HELICS_PROPERTY_TIME_PERIOD, period)
     # Values only matter when they change; the per-step blob always changes.
     h.helicsFederateInfoSetFlagOption(info, h.HELICS_FLAG_ONLY_UPDATE_ON_CHANGE, False)
     fed = h.helicsCreateCombinationFederate(name, info)
     h.helicsFederateInfoFree(info)
-    log.info("HELICS federate '%s' created (core=%s, broker=%s)", name, core_type, broker_address)
+    log.info("HELICS federate '%s' created (core=%s, broker=%s, period=%.0f s)", name, core_type, broker_address, period)
     return fed
-
-
-def request_time(fed: Any, requested: float, who: str) -> float:
-    """`helicsFederateRequestTime` with a watchdog.  Blocking forever is the one
-    failure mode a federate must not have: with the peer dead and the broker
-    still counting it, the stack would sit wedged until someone noticed.  The
-    process exits instead, so compose restarts it into a fresh federation."""
-    h.helicsFederateRequestTimeAsync(fed, requested)
-    deadline = time.monotonic() + GRANT_TIMEOUT
-    while not h.helicsFederateIsAsyncOperationCompleted(fed):
-        if time.monotonic() > deadline:
-            log.error("%s: no time grant for %.0f s — the federation is wedged; exiting for a restart.",
-                      who, GRANT_TIMEOUT)
-            os._exit(3)
-        time.sleep(0.002)
-    return h.helicsFederateRequestTimeComplete(fed)
 
 
 def engine_alive(fed: Any) -> bool:

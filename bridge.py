@@ -5,15 +5,17 @@ bridge.py
 The HELICS ↔ MQTT bridge federate.  Subscribes to the engine's per-step
 publication and republishes it to MQTT exactly as `hdf5_mqtt_publisher.py`
 used to — same topics, same `{step, total_steps, dataset, attributes, values}`
-payload, same latching zero filter, same order — and carries the dashboard's
-`_control/*` commands back into the federation as endpoint messages.
+payload, same latching zero filter, same order — publishes the run's
+provenance, progress and controls catalog as retained `_meta/*` topics, and
+carries the dashboard's setpoints back into the federation as endpoint
+messages.  Play/pause/step/pace are not routed here: the broker owns those.
 
 This is the half of the old publisher that does *not* change when the real
 engine arrives.
 
 Usage
 -----
-    python bridge.py --host mosquitto --topic sim/coesi5 \
+    python bridge.py --host mosquitto --topic sim/coesi5 --period 600 \
         --helics-broker tcp://helics-broker:23404
 """
 
@@ -23,15 +25,15 @@ import logging
 import queue
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
 import helics as h
 import paho.mqtt.client as mqtt
 
 from federation import (
-    DEFAULT_BROKER, DEFAULT_CORE, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP, TIME_DELTA,
-    create_federate, engine_alive, finalize, request_time,
+    DEFAULT_BROKER, DEFAULT_CORE, DEFAULT_PERIOD, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP,
+    create_federate, engine_alive, finalize,
 )
 
 # ---------------------------------------------------------------------------
@@ -196,7 +198,7 @@ def publish_step(
     us steps quicker than Paho's network thread can send them and the queue
     grows without bound (measured: ~40 MB/s at 500×, an OOM kill in minutes).
     Because the engine is in lockstep with us, waiting here is what turns
-    "speed" into "as fast as MQTT can take it" instead of "as fast as memory
+    "free-run" into "as fast as MQTT can take it" instead of "as fast as memory
     can fill".
     """
     published_count = 0
@@ -240,11 +242,13 @@ def publish_step(
 # ---------------------------------------------------------------------------
 
 class Bridge:
-    def __init__(self, client: mqtt.Client, base_topic: str, fed: Any, qos: int) -> None:
+    def __init__(self, client: mqtt.Client, base_topic: str, fed: Any, qos: int, period: float) -> None:
         self.client = client
         self.base_topic = base_topic
         self.fed = fed
         self.qos = qos
+        self.period = period
+        self.run_meta: Dict[str, Any] = {}
         self.sub_run = h.helicsFederateRegisterSubscription(fed, PUB_RUN, "")
         self.sub_step = h.helicsFederateRegisterSubscription(fed, PUB_STEP, "")
         self.endpoint = h.helicsFederateRegisterGlobalEndpoint(fed, EP_BRIDGE, "")
@@ -257,15 +261,18 @@ class Bridge:
         # so commands are queued here and sent from the federation loop.
         self.commands: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.engine_gone = False
+        self.last_step, self.last_pass = 0, 0
         self._last_roster_check = time.monotonic()
 
-    # -- MQTT control listener (relocated from ReplayController, minus seek) ----
+    # -- MQTT control listener: setpoints only ---------------------------------
+    # (play/pause/step/pace are answered by helics_broker.py on the same
+    # _control/ prefix; subscribing narrowly keeps the two from overlapping.)
 
     def subscribe_control(self) -> None:
-        topic = f"{self.base_topic}/_control/#"
+        topic = f"{self.base_topic}/_control/setpoint/#"
         self.client.on_message = self._on_control_message
         self.client.subscribe(topic)
-        log.info("Control listener subscribed to '%s'", topic)
+        log.info("Setpoint listener subscribed to '%s'", topic)
 
     def _on_control_message(self, client, userdata, message) -> None:
         rel = message.topic[len(self.base_topic) + len("/_control/"):]
@@ -277,14 +284,7 @@ class Bridge:
         if not isinstance(payload, dict):
             payload = {}
 
-        if rel in ("play", "pause"):
-            self.commands.put({"command": rel})
-        elif rel == "speed":
-            if "multiplier" in payload:
-                self.commands.put({"command": "speed", "multiplier": payload["multiplier"]})
-            else:
-                log.warning("Control: speed without a 'multiplier' field: %r", raw)
-        elif rel.startswith("setpoint/"):
+        if rel.startswith("setpoint/"):
             if rel.endswith("/ack"):
                 return                      # our own retained acks come back on the wildcard
             target = rel[len("setpoint/"):]
@@ -303,9 +303,16 @@ class Bridge:
     def _on_run(self, raw: str) -> None:
         blob = json.loads(raw)
         metadata = blob.get("metadata", {})
+        self.run_meta = metadata
         self.catalog = blob.get("catalog", {})
         self.n_steps = int(metadata.get("n_steps", 0))
         publish_run_metadata(self.client, self.base_topic, metadata)
+        # What the dashboard may command, retained so a late page builds its
+        # setpoint panel from the engine's word, not from names baked into HTML.
+        controls = blob.get("controls", [])
+        self.client.publish(f"{self.base_topic}/_meta/controls", json.dumps(controls, allow_nan=False),
+                            qos=1, retain=True)
+        log.info("Published controls catalog (retained): %d controllable inputs", len(controls))
 
     def _on_step(self, raw: str) -> None:
         blob = json.loads(raw)
@@ -313,8 +320,28 @@ class Bridge:
         count = publish_step(self.client, self.base_topic, step, self.n_steps, values,
                              self.catalog, self.has_been_nonzero, self.qos)
         self.published_steps += 1
+        self.last_step, self.last_pass = step, blob.get("pass", 0)
+        self._publish_progress(step, self.last_pass, finished=False)
         log.info("Published step %d / %d  (%.1f%%) to %d active topics",
                  step + 1, self.n_steps, 100.0 * (step + 1) / max(self.n_steps, 1), count)
+
+    def _publish_progress(self, step: int, pass_no: int, finished: bool) -> None:
+        """Where the run is, retained: step, pass, the step's calendar time, and
+        whether the engine has finished.  The dashboard's progress bar and its
+        date axis read this — never the wall clock."""
+        sim_time = None
+        dt, start = self.run_meta.get("dt_seconds"), self.run_meta.get("start_time")
+        if isinstance(dt, (int, float)) and start:
+            try:
+                sim_time = (datetime.fromisoformat(start) + timedelta(seconds=step * dt)).isoformat()
+            except ValueError:
+                sim_time = None
+        body = {"step": step, "pass": pass_no, "sim_time": sim_time, "total_steps": self.n_steps,
+                "finished": finished, "at": datetime.now(timezone.utc).isoformat()}
+        # QoS 0 while running (one more small message per step); QoS 1 for the
+        # final word, which a late subscriber must not miss.
+        self.client.publish(f"{self.base_topic}/_meta/progress", json.dumps(body, allow_nan=False),
+                            qos=1 if finished else 0, retain=True)
 
     def _on_engine_message(self, raw: str) -> None:
         try:
@@ -325,15 +352,6 @@ class Bridge:
         if ack.get("command") == "bye":
             log.info("Engine announced it is leaving the federation.")
             self.engine_gone = True
-            return
-        if ack.get("command") == "state":
-            # Retained, like _meta/run: the transport's true state, for any
-            # dashboard that connects now or later.
-            body = {k: ack.get(k) for k in ("playing", "speed", "step")}
-            body["at"] = datetime.now(timezone.utc).isoformat()
-            self.client.publish(f"{self.base_topic}/_meta/state", json.dumps(body, allow_nan=False),
-                                qos=1, retain=True)
-            log.info("Transport state -> _meta/state: %s", body)
             return
         if ack.get("command") != "setpoint_ack":
             log.warning("Unexpected message from engine: %r", ack)
@@ -353,7 +371,12 @@ class Bridge:
         log.info("Entering federation …")
         h.helicsFederateEnterExecutingMode(self.fed)
         while True:
-            self.time = request_time(self.fed, self.time + TIME_DELTA, "bridge")
+            # Lockstep with the engine on the step grid: we ask for the next
+            # step's time, the engine cannot be granted it until we have, and
+            # so no step can be published before we have read the previous one.
+            # Under a barrier this blocks — that *is* pause; setpoints queued
+            # meanwhile are sent at the next grant.
+            self.time = h.helicsFederateRequestTime(self.fed, self.time + self.period)
             if h.helicsInputIsUpdated(self.sub_run):
                 self._on_run(h.helicsInputGetString(self.sub_run))
             if h.helicsInputIsUpdated(self.sub_step):
@@ -363,6 +386,7 @@ class Bridge:
             if self.engine_gone:
                 # A bounded run finished (or the engine was stopped): nothing
                 # more will arrive, and a bridge with no engine is not a bridge.
+                self._publish_progress(self.last_step, self.last_pass, finished=True)
                 break
             # Safety net for an engine that died without saying goodbye: once
             # it is gone our time requests are granted instantly, so this loop
@@ -399,8 +423,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--client-id", default="hdf5_publisher", metavar="ID", help="MQTT client identifier.")
     parser.add_argument("--helics-broker", default=DEFAULT_BROKER, metavar="ADDR", help="HELICS broker address.")
     parser.add_argument("--helics-core", default=DEFAULT_CORE, metavar="TYPE", help="HELICS core type.")
+    parser.add_argument("--period", type=float, default=DEFAULT_PERIOD, metavar="SECONDS",
+                        help="Simulation seconds per step — must match the engine's and the broker's.")
     parser.add_argument("--no-control", action="store_true",
-                        help="Do not listen on <topic>/_control/# for play/pause/speed/setpoint.")
+                        help="Do not listen on <topic>/_control/setpoint/# .")
     return parser.parse_args(argv)
 
 
@@ -414,8 +440,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.error("Cannot connect to broker: %s", exc)
         return 1
 
-    fed = create_federate("bridge", args.helics_broker, args.helics_core)
-    bridge = Bridge(client, args.topic, fed, args.qos)
+    fed = create_federate("bridge", args.helics_broker, args.period, args.helics_core)
+    bridge = Bridge(client, args.topic, fed, args.qos, args.period)
     if not args.no_control:
         bridge.subscribe_control()
 

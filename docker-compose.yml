@@ -3,11 +3,15 @@
 # dashboard. Driven by ./run.sh.
 #
 # Knobs (environment variables, all optional):
-#   DELAY=1.0   baseline seconds per step for the engine (the dashboard's speed
-#               selector divides this at runtime — do not bake a fast delay in here)
+#   PACE=600    initial pace in simulation seconds per real second (600 = one
+#               10-minute step per second); 0 = free-run. Changed live from the
+#               dashboard, so do not bake a "fast" value in here.
+#   PERIOD=600  simulation seconds per step — the file's dt; broker and bridge
+#               must agree with the engine on it
 #   LOOP=1      1 = replay/sensors loop forever (default), 0 = single bounded pass
 #   SEED=       integer seed for reproducible sensor noise and faults (unset = random)
-#   SENSOR_DELAY=1.0  baseline pace of the sensor simulator, independent of DELAY
+#   SENSOR_DELAY=1.0  baseline pace of the sensor simulator, independent of PACE
+#   SIM_START=  ISO 8601 calendar instant of simulation time 0 (default: today, local midnight)
 #
 # The HELICS federation (engine + bridge) is static: it forms with exactly two
 # federates and cannot be joined late. helics-broker outlives federations — it
@@ -38,7 +42,15 @@ services:
     image: hdf5-publisher
     container_name: helics-broker
     entrypoint: ["python3", "helics_broker.py"]
-    command: ["--federates", "2", "--port", "23404"]
+    # The broker is also the run controller (play/pause/step/pace over MQTT),
+    # so it wants Mosquitto — but it serves the federation without it too.
+    command: >
+      --federates 2 --port 23404
+      --period ${PERIOD:-600} --pace ${PACE:-600}
+      --mqtt-host mosquitto --mqtt-port 1883 --topic sim/coesi5
+    depends_on:
+      mosquitto:
+        condition: service_healthy
     healthcheck:
       # The broker writes the sentinel from its own helicsBrokerIsConnected();
       # the socket probe confirms the port is really accepting. A throwaway
@@ -62,7 +74,7 @@ services:
     command: >
       --file 20260623_baseline.hdf5
       --helics-broker tcp://helics-broker:23404
-      --delay ${DELAY:-1.0}
+      ${SIM_START_FLAG-}
       ${LOOP_FLAG---loop}
     restart: on-failure
 
@@ -78,6 +90,7 @@ services:
     command: >
       --host mosquitto --port 1883
       --topic sim/coesi5
+      --period ${PERIOD:-600}
       --helics-broker tcp://helics-broker:23404
     restart: on-failure
 

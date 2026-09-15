@@ -152,6 +152,13 @@
             color: var(--text-muted);
             min-width: 92px;
         }
+        .transport .rate-label {
+            font-family: monospace;
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            min-width: 70px;
+        }
+        .transport .rate-label.finished { color: #fbbf24; }
 
         .status {
             display: flex;
@@ -659,23 +666,21 @@
     </div>
 
     <div class="transport">
-        <button id="btnPlayPause" onclick="togglePlayback()" disabled title="Pause / resume the replay">❚❚</button>
+        <button id="btnPlayPause" onclick="togglePlayback()" disabled title="Pause / resume the run">❚❚</button>
+        <button id="btnStep" onclick="stepOnce()" disabled title="Advance exactly one step (while paused)">⏭</button>
         <input type="range" id="scrubber" min="0" max="0" value="0" step="1" tabindex="-1"
-               title="Replay position (read-only)">
-        <span class="scrub-label" id="lblScrub">– / –</span>
-        <select id="speedSelect" onchange="onSpeedChange()" disabled title="Playback speed">
-            <option value="0.25">0.25×</option>
-            <option value="0.5">0.5×</option>
-            <option value="1" selected>1×</option>
-            <option value="2">2×</option>
-            <option value="5">5×</option>
-            <option value="10">10×</option>
-            <option value="25">25×</option>
-            <option value="50">50×</option>
-            <option value="100">100×</option>
-            <option value="200">200×</option>
-            <option value="500">500×</option>
+               title="Run position (read-only)">
+        <span class="scrub-label" id="lblScrub" title="">– / –</span>
+        <select id="paceSelect" onchange="onPaceChange()" disabled title="Pace: simulated time per real second">
+            <option value="1">1 s/s (real time)</option>
+            <option value="60">1 min/s</option>
+            <option value="600" selected>10 min/s</option>
+            <option value="3600">1 h/s</option>
+            <option value="21600">6 h/s</option>
+            <option value="86400">1 day/s</option>
+            <option value="0">Free-run</option>
         </select>
+        <span class="rate-label" id="lblRate" title="Actual rate the engine is achieving">–</span>
     </div>
 
     <div style="flex-grow: 1;"></div>
@@ -759,12 +764,11 @@
 
         <div class="setpoint-panel">
             <label>Setpoint → engine</label>
-            <select id="setpointBuilding" onchange="onSetpointTargetChange()">
+            <select id="setpointBuilding" onchange="renderSetpointTargets(); onSetpointTargetChange()">
                 <option value="">-- building --</option>
             </select>
             <select id="setpointTarget" onchange="onSetpointTargetChange()">
-                <option value="building/ZoneSetPoint">Zone setpoint (°C)</option>
-                <option value="heating/Qt">Heat-pump heat output (W)</option>
+                <option value="">-- input --</option>
             </select>
             <div class="setpoint-row">
                 <input type="number" id="setpointValue" step="any" placeholder="value">
@@ -919,14 +923,24 @@
     
     // Track parameters for map dropdown
     let activeParametersList = new Set();
-    // building -> model -> full entity path, e.g. bui_0027_0 -> heating ->
-    // "heating_frassinetto_hp2_proc_0-0.heating_frassinetto_hp2_bui_0027_0".
-    // The setpoint control needs the real entity name the engine knows, not
-    // the dashboard's shortened building/model keys.
-    let entityPathFor = {};
+    // The engine's retained _meta/controls: what may be commanded, with units,
+    // range and the variables that move with it. The setpoint panel is built
+    // from this, never from names baked into the page.
+    let controlsCatalog = [];
     // "entity/variable" -> the engine's last retained ack for that target.
     let setpointAcks = {};
     let setpointUiDirty = false;
+
+    function applyControlsCatalog(list) {
+        controlsCatalog = Array.isArray(list) ? list.filter(c => c && c.entity && c.variable) : [];
+        setpointUiDirty = true;
+        scheduleRender();
+    }
+
+    function controlBuildingOf(entity) {
+        const m = String(entity).match(/bui_\d+(_\d+)?/);
+        return m ? m[0] : String(entity);
+    }
 
     // --- Sensor state (sensors/# namespace) ---
     // Deliberately separate from dataStore: sensor readings carry a status and a
@@ -988,8 +1002,7 @@
                 // The retained sim/coesi5/_meta/run arrives on this subscribe if
                 // the wildcard covers it; subscribe explicitly otherwise.
                 if (!topic.endsWith('#')) {
-                    client.subscribe(`${controlBase()}/_meta/run`);
-                    client.subscribe(`${controlBase()}/_meta/state`);
+                    client.subscribe(`${controlBase()}/_meta/#`);
                     client.subscribe(`${controlBase()}/_control/setpoint/#`);
                 }
                 // The sensor stream is an independent publisher on its own
@@ -1026,10 +1039,18 @@
         disconnect();
     }
 
-    // --- Transport control (play / pause / speed) ---
+    // --- Run control (play / pause / step / pace) ---
+    // Every control here is answered by the HELICS *broker*, which holds the
+    // whole federation back with a time barrier — the engine never sees a
+    // transport command. That is why the same buttons will work unchanged
+    // against a real engine that runs as fast as it computes.
     let totalSteps = 0;
-    let isPlaying = true;      // the publisher starts playing
+    let isPlaying = true;      // settled by the retained _meta/state
+    let runMode = null;        // 'paced' | 'free' | 'paused' from _meta/state
+    let runFinished = false;   // from _meta/progress
+    let runPass = 0;           // from _meta/progress (a loop pass, or an RL episode)
     let runMeta = null;
+    let stepArrivals = [];     // wall-clock ms of the last distinct steps, for the actual rate
 
     function controlBase() {
         // "sim/coesi5/#" -> "sim/coesi5"
@@ -1048,11 +1069,12 @@
 
     function setTransportEnabled(enabled) {
         document.getElementById('btnPlayPause').disabled = !enabled;
-        document.getElementById('speedSelect').disabled = !enabled;
+        document.getElementById('paceSelect').disabled = !enabled;
+        document.getElementById('btnStep').disabled = !enabled || isPlaying;
     }
 
-    // The button asks for the opposite of the *engine's* state and shows the
-    // request optimistically; the retained _meta/state the engine publishes on
+    // The button asks for the opposite of the broker's state and shows the
+    // request optimistically; the retained _meta/state the broker publishes on
     // every transition is what settles it (and what a reloaded page, or a
     // second browser, starts from).
     function togglePlayback() {
@@ -1061,35 +1083,102 @@
         updateTransportUI();
     }
 
+    function stepOnce() {
+        if (isPlaying) return;
+        publishControl('step');
+    }
+
     function applyTransportState(state) {
         if (!state || typeof state !== 'object') return;
-        if (typeof state.playing === 'boolean') isPlaying = state.playing;
-        if (typeof state.speed === 'number') {
-            const sel = document.getElementById('speedSelect');
-            const match = Array.from(sel.options).find(o => Number(o.value) === state.speed);
+        if (typeof state.mode === 'string') {
+            runMode = state.mode;
+            isPlaying = state.mode !== 'paused';
+        }
+        if (typeof state.pace === 'number') {
+            const sel = document.getElementById('paceSelect');
+            const match = Array.from(sel.options).find(o => Number(o.value) === state.pace);
             if (match) sel.value = match.value;
         }
-        if (typeof state.step === 'number' && !isPlaying) currentStep = state.step;
         updateTransportUI();
     }
 
-    function onSpeedChange() {
-        const multiplier = Number(document.getElementById('speedSelect').value);
-        publishControl('speed', { multiplier });
+    function applyProgress(p) {
+        if (!p || typeof p !== 'object') return;
+        if (typeof p.total_steps === 'number' && p.total_steps > 0) totalSteps = p.total_steps;
+        if (typeof p.pass === 'number' && p.pass !== runPass) {
+            // A new pass (or, with a real engine, a new RL episode): time went
+            // back to the start. The chart is keyed by step, so it starts over
+            // rather than overwriting the previous pass point by point.
+            runPass = p.pass;
+            clearChartHistory('sim');
+        }
+        runFinished = !!p.finished;
+        updateTransportUI();
+    }
+
+    function onPaceChange() {
+        const pace = Number(document.getElementById('paceSelect').value);
+        publishControl('pace', { sim_seconds_per_second: pace });
+    }
+
+    // Calendar instant of a step: start_time + step × dt, from _meta/run.
+    // Null until the retained run metadata has arrived.
+    function simTimeOfStep(step) {
+        if (!runMeta || !runMeta.start_time || typeof runMeta.dt_seconds !== 'number') return null;
+        const t0 = Date.parse(runMeta.start_time);
+        return Number.isNaN(t0) ? null : t0 + step * runMeta.dt_seconds * 1000;
+    }
+
+    function noteStepArrival(step) {
+        const now = Date.now();
+        if (stepArrivals.length && stepArrivals[stepArrivals.length - 1].step === step) return;
+        stepArrivals.push({ step, at: now });
+        while (stepArrivals.length > 2 && now - stepArrivals[0].at > 3000) stepArrivals.shift();
+    }
+
+    function actualStepsPerSecond() {
+        if (stepArrivals.length < 2) return null;
+        const first = stepArrivals[0], last = stepArrivals[stepArrivals.length - 1];
+        const span = (last.at - first.at) / 1000;
+        if (span <= 0 || Date.now() - last.at > 3000) return null;
+        return (stepArrivals.length - 1) / span;
     }
 
     function updateTransportUI() {
         const btn = document.getElementById('btnPlayPause');
         btn.innerText = isPlaying ? '❚❚' : '▶';
-        btn.title = isPlaying ? 'Pause the replay' : 'Resume the replay';
+        btn.title = isPlaying ? 'Pause the run' : 'Resume the run';
+        document.getElementById('btnStep').disabled = !isConnected || isPlaying;
 
         const scrubber = document.getElementById('scrubber');
         if (totalSteps > 0 && Number(scrubber.max) !== totalSteps - 1) {
             scrubber.max = totalSteps - 1;
         }
         scrubber.value = currentStep;
-        document.getElementById('lblScrub').innerText =
-            `${currentStep} / ${totalSteps ? totalSteps - 1 : '–'}`;
+
+        // Progress reads as simulated calendar time once _meta/run is known.
+        const lbl = document.getElementById('lblScrub');
+        const pct = totalSteps ? Math.round(100 * currentStep / (totalSteps - 1)) : null;
+        const ts = simTimeOfStep(currentStep);
+        if (ts !== null) {
+            lbl.innerText = `${fmtDayClock(ts)} · ${pct}%`;
+            const end = runMeta.end_time ? Date.parse(runMeta.end_time) : NaN;
+            lbl.title = `step ${currentStep} / ${totalSteps - 1}` +
+                (Number.isNaN(end) ? '' : ` — ${fmtFullTime(ts)} → ${fmtFullTime(end)}`) +
+                (runPass ? ` — pass ${runPass + 1}` : '');
+        } else {
+            lbl.innerText = `${currentStep} / ${totalSteps ? totalSteps - 1 : '–'}`;
+            lbl.title = '';
+        }
+
+        const rate = document.getElementById('lblRate');
+        rate.classList.toggle('finished', runFinished);
+        if (runFinished) rate.innerText = 'finished';
+        else if (!isPlaying) rate.innerText = 'paused';
+        else {
+            const r = actualStepsPerSecond();
+            rate.innerText = r === null ? (runMode === 'free' ? 'free-run' : '–') : `${r.toFixed(1)} step/s`;
+        }
     }
 
     // --- Run metadata (provenance) ---
@@ -1097,9 +1186,13 @@
         runMeta = meta;
         if (typeof meta.n_steps === 'number') totalSteps = meta.n_steps;
 
-        const source = meta.source || meta.source_type || 'unknown';
+        const source = meta.source || meta.scenario_name || meta.source_type || 'unknown';
         const shortSource = String(source).split('/').pop();
-        document.getElementById('metaBadge').innerText = `run: ${shortSource}`;
+        const start = meta.start_time ? Date.parse(meta.start_time) : NaN;
+        const end = meta.end_time ? Date.parse(meta.end_time) : NaN;
+        const span = (!Number.isNaN(start) && !Number.isNaN(end))
+            ? ` · ${fmtDayClock(start)} → ${fmtDayClock(end)}` : '';
+        document.getElementById('metaBadge').innerText = `run: ${shortSource}${span}`;
         document.getElementById('metaPopover').innerText =
             Object.entries(meta).map(([k, v]) => `${k.padEnd(12)} ${v}`).join('\n');
         updateTransportUI();
@@ -1138,6 +1231,14 @@
             applyTransportState(payload);
             return;
         }
+        if (topicName.endsWith('/_meta/progress')) {
+            applyProgress(payload);
+            return;
+        }
+        if (topicName.endsWith('/_meta/controls')) {
+            applyControlsCatalog(payload);
+            return;
+        }
         if (topicName.indexOf('/_control/') !== -1) {
             // Retained setpoint acks are state, not commands: they tell us
             // what the engine actually applied, and they arrive on connect.
@@ -1156,13 +1257,6 @@
         if (!parsed) return;
 
         const { model, building, variable } = parsed;
-        if (building !== 'Global') {
-            if (!entityPathFor[building]) entityPathFor[building] = {};
-            if (!entityPathFor[building][model]) {
-                entityPathFor[building][model] = payload.dataset.split('/')[0];
-                setpointUiDirty = true;
-            }
-        }
         const val = payload.values;
         const step = payload.step;
 
@@ -1171,6 +1265,7 @@
 
         // Assigned unconditionally: a --loop wrap moves the replay backwards.
         currentStep = step;
+        noteStepArrival(step);
         if (typeof payload.total_steps === 'number') totalSteps = payload.total_steps;
         if (model === 'time' && variable === 't') currentTime = val;
 
@@ -1918,55 +2013,73 @@
     // reload therefore shows the true applied state, not the last click.
     function setpointEntity() {
         const b = document.getElementById('setpointBuilding').value;
-        const [model, variable] = document.getElementById('setpointTarget').value.split('/');
-        const entity = ((entityPathFor[b] || {})[model]) || null;
-        return { building: b, model, variable, entity };
+        const key = document.getElementById('setpointTarget').value;   // "entity/variable"
+        const ctl = controlsCatalog.find(c => `${c.entity}/${c.variable}` === key && controlBuildingOf(c.entity) === b);
+        return ctl ? { building: b, entity: ctl.entity, variable: ctl.variable, ctl } : { building: b, entity: null, variable: null, ctl: null };
     }
 
     function renderSetpointPanel() {
         const sel = document.getElementById('setpointBuilding');
         const current = sel.value;
-        const options = Array.from(buildings).filter(b => b !== 'Global').sort();
+        const options = Array.from(new Set(controlsCatalog.map(c => controlBuildingOf(c.entity)))).sort();
         sel.innerHTML = '<option value="">-- building --</option>' +
             options.map(b => `<option value="${b}">${b}</option>`).join('');
         if (options.indexOf(current) !== -1) sel.value = current;
-        else if (!current && options.indexOf('bui_0027_0') !== -1) sel.value = 'bui_0027_0';
+        else if (!current && options.length) sel.value = options[0];
+        renderSetpointTargets();
         onSetpointTargetChange();
 
         // Every override the engine currently holds, from the retained acks.
         const active = Object.entries(setpointAcks)
             .filter(([, a]) => a && a.accepted && a.applied !== null && a.applied !== undefined)
-            .map(([k, a]) => {
-                const bm = k.match(/bui_\d+(_\d+)?/);
-                return `<div>⚙ ${bm ? bm[0] : k.split('/')[0]} · ${a.variable} = <b>${fmtVal(a.applied)}</b></div>`;
-            });
+            .map(([k, a]) => `<div>⚙ ${controlBuildingOf(k.split('/')[0])} · ${a.variable} = <b>${fmtVal(a.applied)}</b></div>`);
         document.getElementById('setpointActive').innerHTML =
             active.length ? '<div style="margin-top:4px;">Active overrides:</div>' + active.join('') : '';
     }
 
+    function renderSetpointTargets() {
+        const b = document.getElementById('setpointBuilding').value;
+        const tsel = document.getElementById('setpointTarget');
+        const current = tsel.value;
+        const targets = controlsCatalog.filter(c => controlBuildingOf(c.entity) === b);
+        tsel.innerHTML = '<option value="">-- input --</option>' + targets.map(c => {
+            const range = (typeof c.min === 'number' && typeof c.max === 'number') ? ` ${c.min}–${c.max}` : '';
+            return `<option value="${c.entity}/${c.variable}">${c.variable} (${c.units || '–'}${range})</option>`;
+        }).join('');
+        if (targets.some(c => `${c.entity}/${c.variable}` === current)) tsel.value = current;
+        else if (targets.length) tsel.value = `${targets[0].entity}/${targets[0].variable}`;
+    }
+
     function onSetpointTargetChange() {
-        const { entity, variable } = setpointEntity();
+        const { entity, variable, ctl } = setpointEntity();
         const status = document.getElementById('setpointStatus');
+        const input = document.getElementById('setpointValue');
         const canSend = isConnected && !!entity;
         document.getElementById('setpointApply').disabled = !canSend;
         document.getElementById('setpointClear').disabled = !canSend;
         status.className = 'setpoint-status';
+        if (ctl) {
+            input.min = typeof ctl.min === 'number' ? ctl.min : '';
+            input.max = typeof ctl.max === 'number' ? ctl.max : '';
+            input.placeholder = ctl.units ? `value in ${ctl.units}` : 'value';
+        }
         if (!entity) {
-            status.innerText = buildings.size ? 'No such entity seen yet' : 'Waiting for data…';
+            status.innerText = controlsCatalog.length ? 'Pick a building and an input' : 'Waiting for the controls catalog…';
             return;
         }
+        const coupled = ctl && ctl.couples && ctl.couples.length ? ` — moves ${ctl.couples.join(', ')}` : '';
         const ack = setpointAcks[`${entity}/${variable}`];
-        if (!ack) { status.innerText = 'no override'; return; }
+        if (!ack) { status.innerText = 'no override' + coupled; return; }
         if (!ack.accepted) {
             status.classList.add('rejected');
             status.innerText = `rejected: ${ack.reason || 'unknown'}`;
         } else if (ack.applied === null || ack.applied === undefined) {
-            status.innerText = `no override (cleared at step ${ack.step})`;
+            status.innerText = `no override (cleared at step ${ack.step})` + coupled;
         } else {
             status.classList.add('applied');
             status.innerText = `applied ${fmtVal(ack.applied)} at step ${ack.step}` +
-                (ack.reason ? ` — ${ack.reason}` : '');
-            document.getElementById('setpointValue').placeholder = String(ack.applied);
+                (ack.reason ? ` — ${ack.reason}` : '') + coupled;
+            input.placeholder = String(ack.applied);
         }
     }
 
@@ -2026,8 +2139,12 @@
         allBuildings: () => Array.from(buildings).filter(b => b !== 'Global').sort(),
         allParams: () => Array.from(activeParametersList).sort(),
         hasParam: (b, p) => buildingHasParam(b, p),
-        // The Live Chart shows the simulation's own clock: steps, unchanged.
-        timeAxis: false
+        // The Live Chart shows simulated calendar time — a run is dated — derived
+        // from the step, so storage stays step-keyed. Falls back to steps until
+        // the retained _meta/run has arrived.
+        timeAxis: true,
+        tsOfStep: (step) => simTimeOfStep(step),
+        tickSeconds: () => (runMeta && typeof runMeta.dt_seconds === 'number') ? runMeta.dt_seconds : 0
     });
 
     const sensorChart = makeChartContext({
@@ -2059,21 +2176,27 @@
         DAY, 2 * DAY, 7 * DAY, 14 * DAY, 28 * DAY
     ];
 
+    // A context either carries a timestamp on each point (sensors) or derives
+    // one from the step at render time (simulation: start_time + step × dt from
+    // _meta/run). Storage stays step-keyed in both cases.
     function chartUsesTime(ctx, series) {
-        return !!ctx.timeAxis && series.some(s => s.points.some(p => p.ts !== null && p.ts !== undefined));
+        if (!ctx.timeAxis) return false;
+        if (ctx.tsOfStep) return ctx.tsOfStep(0) !== null;
+        return series.some(s => s.points.some(p => p.ts !== null && p.ts !== undefined));
     }
 
-    function xValueOf(useTime) {
-        return useTime ? (p => (p.ts !== null && p.ts !== undefined ? p.ts : null))
-                       : (p => p.step);
+    function xValueOf(useTime, ctx) {
+        if (!useTime) return p => p.step;
+        if (ctx && ctx.tsOfStep) return p => ctx.tsOfStep(p.step);
+        return p => (p.ts !== null && p.ts !== undefined ? p.ts : null);
     }
 
     // Tick spacing is at least the selected sensor's own report interval, so a
     // 10-minute sensor gets ticks 10 minutes apart that land on actual readings
     // instead of arbitrary step-derived positions.
-    function timeTickStep(span, param) {
+    function timeTickStep(span, param, ctx) {
         const info = sensorTypeInfo[param] || {};
-        const reportMs = Number(info.interval_seconds || 0) * 1000;
+        const reportMs = (ctx && ctx.tickSeconds ? ctx.tickSeconds() : Number(info.interval_seconds || 0)) * 1000;
         const fits = c => span / c <= 9;
 
         if (reportMs > 0) {
@@ -2393,7 +2516,7 @@
 
         // The domain the context declares: simulation steps, or real time.
         const useTime = chartUsesTime(ctx, series);
-        const xOf = xValueOf(useTime);
+        const xOf = xValueOf(useTime, ctx);
 
         let minX = Infinity, maxX = -Infinity, minVal = Infinity, maxVal = -Infinity;
         series.forEach(s => s.points.forEach(p => {
@@ -2425,7 +2548,7 @@
         });
         const span = maxX - minX;
         const xTicks = useTime
-            ? timeTicks(minX, maxX, timeTickStep(span, param))
+            ? timeTicks(minX, maxX, timeTickStep(span, param, ctx))
             : niceTicks(minX, maxX, 8).filter(t => t >= minX && t <= maxX && t % 1 === 0);
         const xTickLabel = useTime ? (t => fmtAxisTime(t, span)) : (t => String(t));
         xTicks.forEach(t => {
@@ -2513,7 +2636,7 @@
         const tt = chartEl(ctx, 'tooltip');
         if (ctx.hoverX === null) { tt.style.display = 'none'; return; }
         const { series } = getChartSeries(key);
-        const xOf = xValueOf(useTime);
+        const xOf = xValueOf(useTime, ctx);
         const tolerance = (maxX - minX) * 0.02;
         const rows = [];
         series.forEach(s => {
@@ -2546,7 +2669,7 @@
         const svg = chartEl(ctx, 'svg');
         svg.addEventListener('mousemove', (e) => {
             const { series } = getChartSeries(key);
-            const xOf = xValueOf(chartUsesTime(ctx, series));
+            const xOf = xValueOf(chartUsesTime(ctx, series), ctx);
             const xs = new Set();
             series.forEach(s => s.points.forEach(p => {
                 const xv = xOf(p);

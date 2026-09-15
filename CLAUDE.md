@@ -8,7 +8,7 @@ A **scientific research tool**, not a production monitoring system: a district
 building-energy simulation stored in HDF5 (`20260623_baseline.hdf5` — 289 datasets,
 4320 steps, 600 s resolution) is replayed step-by-step by a **HELICS engine federate**,
 carried by a **bridge federate** onto MQTT, and rendered in a browser dashboard that can
-talk back (play/pause/speed and *setpoints* that change what the engine publishes
+talk back (play/pause/step/pace and *setpoints* that change what the engine publishes
 next). The HDF5 replay is a stand-in for a real HELICS-based simulation engine; the
 split exists so that swapping the real engine in means replacing one federate. There
 is no database, no server-side state, no build step, and no test suite.
@@ -38,11 +38,11 @@ Dockerfile                 one image for engine / bridge / helics-broker / senso
 federation.py              The HELICS contract: publication + endpoint names, payload shapes, clock
 engine.py                  HELICS engine federate: HDF5 replay, control seam (apply_control), acks
 bridge.py                  HELICS ↔ MQTT bridge: telemetry out (zero filter, payload), _control/* in
-helics_broker.py           HELICS broker runner with a readiness sentinel; recycles per federation
+helics_broker.py           HELICS broker + run control: play/pause/step/pace as a time barrier; recycles per federation
 sensor_simulator.py        Synthetic sensor stream (sensors/#) — own CLI, client and pacing
 datasources/base.py        SimulationDataSource ABC — the swappable contract
 datasources/hdf5_source.py HDF5DataSource — the ONLY module that imports h5py
-replay/controller.py       ReplayController — pacing, play/pause/speed, on_tick hook, run metadata
+replay/controller.py       ReplayController — which steps in what order, passes, dated provenance (no pacing)
 mqtt_web_tester.html       The entire frontend: CSS + markup + JS in one file
 mqtt_tester.py             Terminal subscriber (Rich TUI)
 local_server.py            Static server + /proxy/ CORS stripper for the UrbanSim API
@@ -77,9 +77,10 @@ Looping is the default and is the point: without it the replay ends after the la
 the federation dissolves, the bridge exits, and — since telemetry is QoS 0 and unretained
 — the dashboard has nothing to receive and nothing is listening on `_control/#`.
 `LOOP=0 ./run.sh up` gives a bounded one-shot run; `SEED=42 ./run.sh up` makes the sensor
-noise reproducible. Speed is a runtime concern: `DELAY` (default 1.0) is the baseline
-pace and the dashboard's speed selector divides it, so don't bake a fast delay into the
-compose file.
+noise reproducible. Pace is a runtime concern: `PACE` (default 600 simulated seconds per
+real second = one step per second; `0` = free-run) is only the *initial* pace and the
+dashboard changes it live, so don't bake a fast value into the compose file. `PERIOD`
+(default 600) is the file's dt and must match on broker, bridge and engine.
 
 Host-side iteration (what to use while changing the Python):
 
@@ -92,9 +93,9 @@ needs the broker to connect *back* to each federate, which a broker inside Docke
 Desktop's VM cannot reliably do to processes on the Mac):
 
 ```bash
-.venv/bin/python helics_broker.py --federates 2 --port 23404
-.venv/bin/python bridge.py -t sim/coesi5 --helics-broker tcp://127.0.0.1:23404
-.venv/bin/python engine.py -f 20260623_baseline.hdf5 --delay 0.3 --loop --helics-broker tcp://127.0.0.1:23404
+.venv/bin/python helics_broker.py --federates 2 --port 23404 --period 600 --pace 2000 --mqtt-host 127.0.0.1 -t sim/coesi5
+.venv/bin/python bridge.py -t sim/coesi5 --period 600 --helics-broker tcp://127.0.0.1:23404
+.venv/bin/python engine.py -f 20260623_baseline.hdf5 --loop --helics-broker tcp://127.0.0.1:23404
 .venv/bin/python sensor_simulator.py -f 20260623_baseline.hdf5 -t sensors --delay 0.3 --seed 42
 ```
 
@@ -106,16 +107,20 @@ Driving a running replay:
 
 ```bash
 mosquitto_pub -t sim/coesi5/_control/pause -m ''
-mosquitto_pub -t sim/coesi5/_control/speed -m '{"multiplier": 4.0}'
+mosquitto_pub -t sim/coesi5/_control/step  -m ''                                  # one step while paused
+mosquitto_pub -t sim/coesi5/_control/pace  -m '{"sim_seconds_per_second": 3600}'  # 0 = free-run
 mosquitto_pub -t sim/coesi5/_control/play  -m ''
+mosquitto_sub -t sim/coesi5/_meta/state -C 1      # retained {mode, pace, allowed_sim_time, period}
+mosquitto_sub -t sim/coesi5/_meta/progress -C 1   # retained {step, pass, sim_time, total_steps, finished}
 E=heating_frassinetto_hp2_proc_0-0.heating_frassinetto_hp2_bui_0027_0
 mosquitto_pub -t sim/coesi5/_control/setpoint/$E/Qt -m '{"value": 0}'   # park the heat pump
 mosquitto_sub -t sim/coesi5/_control/setpoint/$E/Qt/ack -C 1            # retained: what was applied
 mosquitto_pub -t sim/coesi5/_control/setpoint/$E/Qt -n                  # clear the override
 ```
 
-There is no `seek`: the bridge implements no such branch and the engine has no such
-command. Sending one is logged as unknown and ignored.
+There is no `seek` and no `speed`. Play/pause/step/pace are answered by
+`helics_broker.py`, never by the engine or the bridge; a setpoint is the only command
+that reaches the engine. Unknown commands are logged and ignored.
 
 ## Invariants — do not break these without being asked
 
@@ -142,11 +147,15 @@ command. Sending one is logged as unknown and ignored.
 - **No decimation or downsampling in the engine or bridge.** Full fidelity is what gets
   published; rendering-side downsampling belongs in the dashboard's charting code only
   (`compressSeries` already does this).
-- **Pacing lives in `ReplayController`, nowhere else.** No `time.sleep` in the engine's
-  publish loop or in the bridge. The controller's `on_tick` hook is where the engine
-  services the federation (advances HELICS time, drains its endpoint) — playing *or
-  paused*, which is what lets a `play` reach a paused engine. HELICS time is the
-  engine's wall clock, not simulation time (`step × dt_seconds` from `_meta/run` is).
+- **HELICS time is simulation time, and pacing lives in the broker's time barrier,
+  nowhere else.** The engine requests `t + period` per step and publishes when granted;
+  it never sleeps and never sees play/pause/step/pace. `helics_broker.py` holds the whole
+  federation back with `helicsBrokerSetTimeBarrier` and moves the barrier on a wall
+  clock to pace it. This is what makes the same controls work for a real engine whose
+  federates run as fast as they compute. Do not add pacing to the engine, the bridge
+  or `ReplayController`.
+- **Pace can only slow a run.** Never present a pace as achieved; the dashboard shows the
+  actual step rate next to the requested pace, and must keep doing so.
 - **HELICS calls happen on one thread.** Paho delivers on its own network thread; the
   bridge queues commands and sends them from the federation loop. Do not call `helics*`
   from an MQTT callback.
@@ -198,14 +207,17 @@ command. Sending one is logged as unknown and ignored.
 
 There is no test suite, so verify against the real thing:
 
-- **Bridge parity** — run `helics_broker.py` + `bridge.py` + `engine.py --delay 0
+- **Bridge parity** — run `helics_broker.py --pace 0` + `bridge.py` + `engine.py
   --end-step 4` host-side with `mosquitto_sub -t 'sim/coesi5/#' -F '%t\t%p'` capturing,
   and compare the `(topic, payload)` sequence against the baseline the retired
   `hdf5_mqtt_publisher.py` produced for the same steps (869 telemetry messages, in
   order; `_meta/run` equal apart from `started_at`). Ordering matters as much as content.
-- **Control behaviour** — run at `--delay 0.3 --loop`, publish `pause`, confirm step
-  advancement stops while the engine keeps ticking HELICS time (its log keeps a live
-  `t=`), then `play` and confirm it resumes from the paused step, not `start_step`.
+- **Run control** — with `--loop` and `--pace 1200`, count bridge "Published step" lines
+  over 5 s (expect ~10); publish `pause`, confirm the count stops; publish `step` twice
+  and confirm exactly two more; publish `pace 6000` + `play` and confirm ~10 steps/s;
+  `pace 0` and confirm free-run (>100 steps/s). `_meta/state` must be retained and
+  reflect each transition; a setpoint published while paused must be acknowledged right
+  after `play`.
 - **Setpoint round-trip** — publish `_control/setpoint/<entity>/<variable>` with a
   value, confirm the ack arrives retained (`mosquitto_sub -F '%r'` prints `1`) with the
   applied value, and that the next telemetry for that variable — and its coupled one
@@ -225,7 +237,7 @@ There is no test suite, so verify against the real thing:
 - **Sensor stream** — run `sensor_simulator.py --seed 42`, subscribe a *fresh* client to
   `sensors/#` mid-run and confirm the retained `_meta/sensors` arrives immediately; check
   every dropout has `value: null` and every fault has a non-null value. Confirm cadence
-  independence by publishing `_control/pause` and `_control/speed` to the *simulation* and
+  independence by publishing `_control/pause` and `_control/pace` to the *simulation* and
   measuring that the sensor readings/second does not move.
 - **Frontend** — `node --check` the extracted `<script>` block at minimum; the handlers
   can also be exercised in Node against a small DOM shim. For chart or table changes,
