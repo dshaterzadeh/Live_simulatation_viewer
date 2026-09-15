@@ -174,7 +174,7 @@ that reaches the engine. Unknown commands are logged and ignored.
   been fixed once already; do not write a second charting or table path that could
   reintroduce either bug. Same for `buildGridTable`/`paintGridTable`.
 - **The sensor simulator has no control channel.** It does not use `ReplayController` and
-  must keep streaming at its own cadence while the replay is paused, sought or sped up.
+  must keep streaming at its own cadence while the run is paused, stepped or re-paced.
 - **Sensor cadence derives from the source's `dt_seconds`**, never hardcoded against the
   reference file's 600 s.
 - **Sensor values are calibrated into a per-type `TargetRange` before noise is applied.**
