@@ -31,7 +31,7 @@ import paho.mqtt.client as mqtt
 
 from federation import (
     DEFAULT_BROKER, DEFAULT_CORE, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP, TIME_DELTA,
-    create_federate, engine_alive, finalize,
+    create_federate, engine_alive, finalize, request_time,
 )
 
 # ---------------------------------------------------------------------------
@@ -190,8 +190,17 @@ def publish_step(
     Publish one step to its per-variable sub-topics.  Filters out zeroes with
     the latching rule: a dataset is suppressed only while it has *never* been
     non-zero.  Returns the number of messages published.
+
+    Blocks until the step's last message has actually been written to the
+    socket.  `client.publish` only *queues*; without this, a fast engine hands
+    us steps quicker than Paho's network thread can send them and the queue
+    grows without bound (measured: ~40 MB/s at 500×, an OOM kill in minutes).
+    Because the engine is in lockstep with us, waiting here is what turns
+    "speed" into "as fast as MQTT can take it" instead of "as fast as memory
+    can fill".
     """
     published_count = 0
+    last_info = None
     for entity, variables in step_values.items():
         for variable, value in variables.items():
             clean_path = f"{entity}/{variable}"
@@ -216,8 +225,13 @@ def publish_step(
             }
 
             message = json.dumps(payload, allow_nan=False)
-            client.publish(topic, message, qos=qos)
+            last_info = client.publish(topic, message, qos=qos)
             published_count += 1
+    if last_info is not None:
+        try:
+            last_info.wait_for_publish(timeout=30.0)
+        except (RuntimeError, ValueError) as exc:   # not queued / timed out
+            log.warning("Step %d: MQTT send did not complete in time (%s)", step, exc)
     return published_count
 
 
@@ -312,6 +326,15 @@ class Bridge:
             log.info("Engine announced it is leaving the federation.")
             self.engine_gone = True
             return
+        if ack.get("command") == "state":
+            # Retained, like _meta/run: the transport's true state, for any
+            # dashboard that connects now or later.
+            body = {k: ack.get(k) for k in ("playing", "speed", "step")}
+            body["at"] = datetime.now(timezone.utc).isoformat()
+            self.client.publish(f"{self.base_topic}/_meta/state", json.dumps(body, allow_nan=False),
+                                qos=1, retain=True)
+            log.info("Transport state -> _meta/state: %s", body)
+            return
         if ack.get("command") != "setpoint_ack":
             log.warning("Unexpected message from engine: %r", ack)
             return
@@ -330,7 +353,7 @@ class Bridge:
         log.info("Entering federation …")
         h.helicsFederateEnterExecutingMode(self.fed)
         while True:
-            self.time = h.helicsFederateRequestTime(self.fed, self.time + TIME_DELTA)
+            self.time = request_time(self.fed, self.time + TIME_DELTA, "bridge")
             if h.helicsInputIsUpdated(self.sub_run):
                 self._on_run(h.helicsInputGetString(self.sub_run))
             if h.helicsInputIsUpdated(self.sub_step):

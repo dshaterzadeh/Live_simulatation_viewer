@@ -987,7 +987,11 @@
                 client.subscribe(topic);
                 // The retained sim/coesi5/_meta/run arrives on this subscribe if
                 // the wildcard covers it; subscribe explicitly otherwise.
-                if (!topic.endsWith('#')) client.subscribe(`${controlBase()}/_meta/run`);
+                if (!topic.endsWith('#')) {
+                    client.subscribe(`${controlBase()}/_meta/run`);
+                    client.subscribe(`${controlBase()}/_meta/state`);
+                    client.subscribe(`${controlBase()}/_control/setpoint/#`);
+                }
                 // The sensor stream is an independent publisher on its own
                 // namespace, so it needs its own subscription regardless of the
                 // simulation topic typed above.
@@ -1047,9 +1051,25 @@
         document.getElementById('speedSelect').disabled = !enabled;
     }
 
+    // The button asks for the opposite of the *engine's* state and shows the
+    // request optimistically; the retained _meta/state the engine publishes on
+    // every transition is what settles it (and what a reloaded page, or a
+    // second browser, starts from).
     function togglePlayback() {
         isPlaying = !isPlaying;
         publishControl(isPlaying ? 'play' : 'pause');
+        updateTransportUI();
+    }
+
+    function applyTransportState(state) {
+        if (!state || typeof state !== 'object') return;
+        if (typeof state.playing === 'boolean') isPlaying = state.playing;
+        if (typeof state.speed === 'number') {
+            const sel = document.getElementById('speedSelect');
+            const match = Array.from(sel.options).find(o => Number(o.value) === state.speed);
+            if (match) sel.value = match.value;
+        }
+        if (typeof state.step === 'number' && !isPlaying) currentStep = state.step;
         updateTransportUI();
     }
 
@@ -1112,6 +1132,10 @@
 
         if (topicName.endsWith('/_meta/run')) {
             applyRunMetadata(payload);
+            return;
+        }
+        if (topicName.endsWith('/_meta/state')) {
+            applyTransportState(payload);
             return;
         }
         if (topicName.indexOf('/_control/') !== -1) {

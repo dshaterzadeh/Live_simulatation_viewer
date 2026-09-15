@@ -16,6 +16,7 @@ break — the real federation.
 """
 
 import argparse
+import json
 import logging
 import pathlib
 import signal
@@ -29,6 +30,29 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] heli
 log = logging.getLogger("helics_broker")
 
 SENTINEL = pathlib.Path("/tmp/helics-broker.ready")
+
+
+def dead_core(broker) -> bool:
+    """True when the broker reports a core in the disconnected/error state
+    while the federation as a whole is still up."""
+    query = h.helicsCreateQuery("root", "global_status")
+    try:
+        status = h.helicsQueryBrokerExecute(query, broker)
+    finally:
+        h.helicsQueryFree(query)
+    if isinstance(status, str):
+        try:
+            status = json.loads(status)
+        except ValueError:
+            return False
+    if not isinstance(status, dict):
+        # e.g. "#disconnected" while the broker is tearing down: no signal.
+        return False
+    inner = status.get("status")
+    if not isinstance(inner, dict):
+        return False
+    cores = inner.get("cores", [])
+    return any(isinstance(c, dict) and c.get("state") in ("disconnected", "error") for c in cores)
 
 
 def main() -> int:
@@ -54,7 +78,9 @@ def main() -> int:
     # `restart:` policies only ever have to bring back the engine and bridge.
     while not stop:
         broker = h.helicsCreateBroker(
-            args.core, "coesi_broker", f"-f {args.federates} --port {args.port} --external"
+            args.core, "coesi_broker",
+            # --tick/--timeout: declare a silent core lost after ~10 s, not 30.
+            f"-f {args.federates} --port {args.port} --external --tick 2000 --timeout 10000"
         )
         if not h.helicsBrokerIsConnected(broker):
             log.error("Broker failed to bind on port %d", args.port)
@@ -62,8 +88,20 @@ def main() -> int:
         SENTINEL.write_text(str(time.time()))
         log.info("Broker up on %s port %d, waiting for %d federates", args.core, args.port, args.federates)
 
+        dead_since = None
         while not stop and h.helicsBrokerIsConnected(broker):
             time.sleep(0.5)
+            # A member that died uncleanly can leave the federation wedged: the
+            # survivor waits for grants that never come and a restarted member
+            # is refused ("already in initialization mode"). The broker is the
+            # one party that sees every core, so it is the one to pull the plug.
+            if dead_core(broker):
+                dead_since = dead_since or time.monotonic()
+                if time.monotonic() - dead_since > 5.0:
+                    log.warning("A federate's core is disconnected; tearing the federation down")
+                    break
+            else:
+                dead_since = None
 
         try:
             SENTINEL.unlink()

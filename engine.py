@@ -30,7 +30,7 @@ from datasources import HDF5DataSource
 from datasources.hdf5_source import explore_hdf5
 from federation import (
     DEFAULT_BROKER, DEFAULT_CORE, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP, TIME_DELTA,
-    create_federate, finalize,
+    create_federate, finalize, request_time,
 )
 from replay import ReplayController
 
@@ -117,7 +117,7 @@ class Engine:
     def tick(self) -> None:
         """Advance the federation by one slice and act on anything the bridge sent.
         Called from the controller's wait loop, playing or paused."""
-        self.time = h.helicsFederateRequestTime(self.fed, self.time + TIME_DELTA)
+        self.time = request_time(self.fed, self.time + TIME_DELTA, "engine")
         while h.helicsEndpointHasMessage(self.endpoint):
             msg = h.helicsEndpointGetMessage(self.endpoint)
             self._dispatch(h.helicsMessageGetString(msg))
@@ -136,19 +136,33 @@ class Engine:
         if command == "play":
             self.controller.play()
             log.info("Control: play (from step %d)", self.controller.current_step)
+            self._send_state()
         elif command == "pause":
             self.controller.pause()
             log.info("Control: pause (at step %d)", self.controller.current_step)
+            self._send_state()
         elif command == "speed":
             if "multiplier" in cmd:
                 self.controller.set_speed(cmd["multiplier"])
                 log.info("Control: speed x%s", cmd["multiplier"])
+                self._send_state()
             else:
                 log.warning("Control: speed without a 'multiplier' field: %r", raw)
         elif command == "setpoint":
             self._setpoint(cmd)
         else:
             log.warning("Control: unknown command %r", command)
+
+    def _send_state(self) -> None:
+        """Transport state as the engine holds it — what the dashboard renders,
+        instead of guessing from its own last click."""
+        state = {
+            "command": "state",
+            "playing": not self.controller.paused,
+            "speed": self.controller.speed,
+            "step": self.controller.current_step,
+        }
+        h.helicsEndpointSendBytesTo(self.endpoint, json.dumps(state).encode(), EP_BRIDGE)
 
     def _setpoint(self, cmd: Dict[str, Any]) -> None:
         entity, variable = cmd.get("entity"), cmd.get("variable")
@@ -196,6 +210,7 @@ class Engine:
             json.dumps({"metadata": self.controller.get_run_metadata(), "catalog": catalog}, allow_nan=False),
         )
         log.info("Published run metadata + catalog (%d datasets) to '%s'", n_datasets, PUB_RUN)
+        self._send_state()
 
         n_steps = self.source.get_step_count()
         log.info(

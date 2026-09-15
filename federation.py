@@ -21,6 +21,8 @@ Endpoints (messages, JSON strings):
                                    "variable": str, "value": number | null}
     EP_BRIDGE  engine -> bridge   {"command": "setpoint_ack", "entity", "variable",
                                    "requested", "applied", "accepted", "reason", "step"}
+                                  {"command": "state", "playing": bool, "speed": float,
+                                   "step": int}     at start and on every play/pause/speed
                                   {"command": "bye"}   sent once, before the engine leaves
 
 Clock: HELICS time is advanced by the engine in TIME_DELTA slices from its own
@@ -33,6 +35,8 @@ does not care which, it only reads what arrives at each grant.
 
 import json
 import logging
+import os
+import time
 from typing import Any, List
 
 import helics as h
@@ -50,6 +54,10 @@ EP_BRIDGE = "bridge/control"
 DEFAULT_BROKER = "tcp://localhost:23404"
 DEFAULT_CORE = "zmq"
 
+#: A time request that is not granted within this many seconds means the other
+#: federate is gone and the broker has not noticed: the federation is wedged.
+GRANT_TIMEOUT = 20.0
+
 
 def create_federate(name: str, broker_address: str, core_type: str = DEFAULT_CORE) -> Any:
     """A combination federate (values + messages) joined to the shared broker."""
@@ -65,6 +73,22 @@ def create_federate(name: str, broker_address: str, core_type: str = DEFAULT_COR
     h.helicsFederateInfoFree(info)
     log.info("HELICS federate '%s' created (core=%s, broker=%s)", name, core_type, broker_address)
     return fed
+
+
+def request_time(fed: Any, requested: float, who: str) -> float:
+    """`helicsFederateRequestTime` with a watchdog.  Blocking forever is the one
+    failure mode a federate must not have: with the peer dead and the broker
+    still counting it, the stack would sit wedged until someone noticed.  The
+    process exits instead, so compose restarts it into a fresh federation."""
+    h.helicsFederateRequestTimeAsync(fed, requested)
+    deadline = time.monotonic() + GRANT_TIMEOUT
+    while not h.helicsFederateIsAsyncOperationCompleted(fed):
+        if time.monotonic() > deadline:
+            log.error("%s: no time grant for %.0f s — the federation is wedged; exiting for a restart.",
+                      who, GRANT_TIMEOUT)
+            os._exit(3)
+        time.sleep(0.002)
+    return h.helicsFederateRequestTimeComplete(fed)
 
 
 def engine_alive(fed: Any) -> bool:
