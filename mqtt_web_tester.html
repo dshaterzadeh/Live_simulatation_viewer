@@ -3,267 +3,471 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HDF5 Heatmap Dashboard</title>
+    <title>COESI Live Simulation</title>
+    <!-- Theme is resolved before first paint, exactly as coesi-frontend-main's
+         bootstrapTheme() does: same localStorage key, same <html data-theme>,
+         so a user who has chosen dark in UrbanSim gets dark here. -->
+    <script>
+        (function () {
+            let mode = 'auto';
+            try { mode = localStorage.getItem('coesi.theme') || 'auto'; } catch (e) {}
+            const dark = mode === 'dark' || (mode === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+            document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+        })();
+    </script>
     <!-- Paho MQTT -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.2/mqttws31.min.js"></script>
-    
+
     <!-- MapLibre & Deck.GL -->
     <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
     <script src="https://unpkg.com/deck.gl@8.9.33/dist.min.js"></script>
 
     <style>
+        /* =====================================================================
+           1. DESIGN TOKENS — copied verbatim from
+              coesi-frontend-main/src/index.css (:root and :root[data-theme="dark"]).
+              Do not edit here: when the frontend's tokens change, paste them
+              over this block. Everything below is styled only through these.
+           ===================================================================== */
         :root {
-            --bg-dark: #0f172a;
-            --bg-panel: #1e293b;
-            --text-main: #f8fafc;
-            --text-muted: #94a3b8;
-            --primary: #3b82f6;
-            --border: #334155;
+            --coesi-bg: #ffffff;
+            --coesi-page-bg: #F9FAFB;
+            --coesi-surface: #ffffff;
+            --coesi-surface-subtle: #F9FAFB;
+            --coesi-surface-muted: #F3F4F6;
+            --coesi-surface-brand: #F5FAF0;
+            --coesi-surface-brand-soft: #EBF5DE;
+            --coesi-overlay: rgba(0, 0, 0, .45);
+            --coesi-seg-thumb: #ffffff;
+            --coesi-text: #213547;
+            --coesi-text-strong: #111827;
+            --coesi-text-secondary: #374151;
+            --coesi-text-muted: #6B7280;
+            --coesi-text-faint: #9CA3AF;
+            --coesi-border: #E5E7EB;
+            --coesi-border-strong: #D1D5DB;
+            --coesi-divider: #F3F4F6;
+            --coesi-accent: #eeff00;
+            --coesi-accent-hover: #d4e600;
+            --coesi-accent-soft: rgba(200, 240, 108, .5);
+            --coesi-accent-soft-bg: rgba(200, 240, 108, .2);
+            --coesi-danger: #DC2626;
+            --coesi-danger-bg: #FEF2F2;
+            --coesi-info: #4E7FA0;
+            --coesi-info-bg: #EFF6FF;
+            --coesi-info-border: #BFDBFE;
+            --coesi-nav-idle: #4a5e38;
+            --coesi-nav-green: #2d4a1e;
+            --coesi-nav-green-bg: rgba(200, 240, 108, .3);
+            --coesi-tab-chip-bg: #E8EAF0;
+            --coesi-tab-chip-fg: #4F46E5;
+            --coesi-tab-active-bg: #456F8C;
+            --coesi-tab-active-fg: #ffffff;
+            --coesi-nav-purple: #4338ca;
+            --coesi-nav-purple-bg: rgba(99, 102, 241, .12);
+            --coesi-success-bg: #ECFDF5;
+            --coesi-success-text: #065F46;
+            --coesi-warning-bg: #FFFBEB;
+            --coesi-warning-text: #92400E;
+            --coesi-overlay-btn: rgba(255, 255, 255, .72);
+            --coesi-overlay-btn-hover: rgba(255, 255, 255, .95);
+            --coesi-control-bar-bg: #ffffff;
+            --coesi-control-bar-border: #dddddd;
+            --coesi-control-hover: #f0f0f0;
+            --coesi-control-active: #e0e0e0;
+            --coesi-control-divider: #cccccc;
+            --coesi-shadow: 0 10px 30px rgba(0, 0, 0, .12);
+        }
+        :root[data-theme="dark"] {
+            color-scheme: dark;
+            --coesi-bg: #0F141A;
+            --coesi-page-bg: #0F141A;
+            --coesi-surface: #161C24;
+            --coesi-surface-subtle: #1E2630;
+            --coesi-surface-muted: #232C38;
+            --coesi-surface-brand: #161C24;
+            --coesi-surface-brand-soft: #1B2A18;
+            --coesi-overlay: rgba(0, 0, 0, .6);
+            --coesi-seg-thumb: #556781;
+            --coesi-text: #E6EDF3;
+            --coesi-text-strong: #F3F7FA;
+            --coesi-text-secondary: #C4CFDA;
+            --coesi-text-muted: #94A3B3;
+            --coesi-text-faint: #94A3B3;
+            --coesi-border: #2A3442;
+            --coesi-border-strong: #3A465A;
+            --coesi-divider: #232C38;
+            --coesi-danger: #F87171;
+            --coesi-danger-bg: #3A1F1F;
+            --coesi-info: #8FBBD9;
+            --coesi-info-bg: #1A2836;
+            --coesi-info-border: #33506B;
+            --coesi-nav-idle: #A8BC96;
+            --coesi-nav-green: #D3F08A;
+            --coesi-nav-green-bg: rgba(200, 240, 108, .18);
+            --coesi-tab-chip-bg: #1E2A3D;
+            --coesi-tab-chip-fg: #A5B4FC;
+            --coesi-tab-active-bg: #3A6E96;
+            --coesi-tab-active-fg: #F3F7FA;
+            --coesi-nav-purple: #B0B7FF;
+            --coesi-nav-purple-bg: rgba(99, 102, 241, .22);
+            --coesi-success-bg: #14291F;
+            --coesi-success-text: #6EE7B7;
+            --coesi-warning-bg: #2E2413;
+            --coesi-warning-text: #FBBF24;
+            --coesi-overlay-btn: rgba(15, 20, 26, .74);
+            --coesi-overlay-btn-hover: rgba(15, 20, 26, .92);
+            --coesi-control-bar-bg: #2a2a2a;
+            --coesi-control-bar-border: #444444;
+            --coesi-control-hover: #404040;
+            --coesi-control-active: #555555;
+            --coesi-control-divider: #555555;
+            --coesi-shadow: 0 10px 30px rgba(0, 0, 0, .55);
         }
 
+        /* =====================================================================
+           2. PROTOTYPE TOKENS — values this page needs that the frontend has
+              no token for yet (it uses the same literals inline: the run-state
+              colours in SimulationPreview.tsx and the series palette in
+              SimulationResults.tsx). When merging, add these to index.css and
+              the page needs no other change. The JS reads them through
+              tokens() — there are no colour literals in the script.
+           ===================================================================== */
+        :root {
+            --proto-font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+            /* run state — SimulationPreview.tsx:763-769 */
+            --proto-state-running: #3b82f6;
+            --proto-state-paused: #f59e0b;
+            --proto-state-done: #10b981;
+            --proto-state-failed: #ef4444;
+            /* sensor status */
+            --proto-fault: #F59E0B;
+            --proto-nodata-rgb: 156, 163, 175;          /* --coesi-text-faint as r,g,b for deck.gl */
+            /* heat ramp: red for positive, blue for negative, alpha by magnitude */
+            --proto-heat-pos-rgb: 239, 68, 68;
+            --proto-heat-neg-rgb: 59, 130, 246;
+            /* chart series — SimulationResults.tsx:81-92, first eight */
+            --proto-chart-1: #3B82F6;
+            --proto-chart-2: #EF4444;
+            --proto-chart-3: #059669;
+            --proto-chart-4: #F59E0B;
+            --proto-chart-5: #8B5CF6;
+            --proto-chart-6: #06B6D4;
+            --proto-chart-7: #84CC16;
+            --proto-chart-8: #F97316;
+            --proto-chart-grid: #E5E7EB;
+            /* map */
+            --proto-map-outline-rgb: 55, 65, 81;
+            --proto-map-style: "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json";
+        }
+        :root[data-theme="dark"] {
+            --proto-chart-3: #6EE7B7;
+            --proto-chart-grid: #2A3442;
+            --proto-nodata-rgb: 148, 163, 179;
+            --proto-map-outline-rgb: 230, 237, 243;
+            --proto-map-style: "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json";
+        }
+
+        /* =====================================================================
+           3. BASE — index.css:30-32 typography, page ground
+           ===================================================================== */
+        * { box-sizing: border-box; }
         body {
-            font-family: 'Inter', system-ui, sans-serif;
+            font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
+            font-size: 14px;
+            line-height: 1.5;
+            font-weight: 400;
             margin: 0;
-            background-color: var(--bg-dark);
-            color: var(--text-main);
+            background: var(--coesi-page-bg);
+            color: var(--coesi-text);
             display: flex;
             flex-direction: column;
             height: 100vh;
             overflow: hidden;
         }
+        button { font-family: inherit; }
+        input, select { font-family: inherit; }
 
-        .top-bar {
-            padding: 8px 12px;
-            background: var(--bg-panel);
-            border-bottom: 1px solid var(--border);
+        /* =====================================================================
+           4. COMPONENTS — each block names the frontend counterpart it mirrors
+           ===================================================================== */
+
+        /* -- App header: headerProjects.tsx:317-452 (workspace header) --------
+           Fixed geometry. No wrapping; every item has a set width and the
+           progress bar alone takes up the slack, so nothing shifts while the
+           run advances. Below 1180px the metadata badge goes, below 1400px the
+           brand subtitle, and the bar still fits without moving anything. */
+        .app-header {
+            height: 56px;
+            padding: 0 16px;
+            background: var(--coesi-surface);
+            border-bottom: 0.5px solid rgba(128, 128, 128, .3);
             display: flex;
-            gap: 8px;
+            flex-wrap: nowrap;
+            gap: 10px;
             align-items: center;
             flex-shrink: 0;
             z-index: 1000;
         }
-        .top-bar input {
-            padding: 5px 8px;
-            font-size: 0.8rem;
-        }
-        .top-bar button {
-            padding: 6px 12px;
-            font-size: 0.8rem;
-        }
-
-        .tabs {
-            display: flex;
-            gap: 4px;
-            margin-right: 10px;
-        }
-        .tab-btn {
-            background: transparent;
-            color: var(--text-muted);
-            border: 1px solid var(--border);
-            padding: 6px 12px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: bold;
-            font-size: 0.8rem;
-            white-space: nowrap;
-        }
-        .tab-btn.active {
-            background: var(--primary);
-            color: white;
-            border-color: var(--primary);
-        }
-
-        input, select {
-            background: var(--bg-dark);
-            border: 1px solid var(--border);
-            color: white;
-            padding: 8px 12px;
-            border-radius: 6px;
-            font-size: 0.9rem;
-            outline: none;
-        }
-
-        button {
-            background: var(--primary);
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: 0.2s;
-        }
-        button:hover { background: #2563eb; }
-        button.danger { background: #ef4444; }
-        button.danger:hover { background: #dc2626; }
-        button.secondary { background: transparent; border: 1px solid var(--primary); color: var(--primary); }
-        button.secondary:hover { background: rgba(59, 130, 246, 0.1); }
-
-        .global-stats {
-            display: flex;
-            gap: 12px;
-            color: #10b981;
-            font-weight: bold;
-            font-family: monospace;
-            font-size: 0.85rem;
-            margin-left: 8px;
-            white-space: nowrap;
-        }
-
-        /* Transport bar (play/pause + scrubber) */
-        .transport {
+        .app-header > * { flex: 0 0 auto; }
+        .header-spacer { flex: 1 1 0; min-width: 0; }
+        .brand {
             display: flex;
             align-items: center;
             gap: 8px;
-            margin-left: 8px;
+            font-weight: 600;
+            font-size: 15px;
+            color: var(--coesi-text-strong);
+            letter-spacing: .01em;
+            white-space: nowrap;
+            padding-right: 4px;
+        }
+        .brand-mark {
+            width: 22px;
+            height: 22px;
+            border-radius: 6px;
+            background: #C8F06C;
+            color: #1B2A12;
+            font-size: 12px;
+            font-weight: 700;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .brand-sub { color: var(--coesi-text-muted); font-weight: 400; }
+        /* -- Buttons: 34px / 8px-radius / 13px vocabulary --------------------
+           primary = headerProjects.tsx:417-429 (Run Simulation, yellow accent)
+           outline = headerProjects.tsx:201-219 (dropdown trigger)
+           toolbar = InputEditor/Table.css:11-38 */
+        button {
+            height: 34px;
+            padding: 0 12px;
+            border-radius: 8px;
+            border: 1px solid var(--coesi-border-strong);
+            background: var(--coesi-surface);
+            color: var(--coesi-text-secondary);
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background .15s ease, border-color .15s ease, color .15s ease;
+        }
+        button:hover { background: var(--coesi-surface-muted); }
+        /* Keyboard focus only: a click must not leave a ring behind. */
+        button:focus { outline: none; }
+        button:focus-visible { outline: 2px solid var(--coesi-info); outline-offset: 1px; }
+        button:disabled { opacity: .55; cursor: not-allowed; background: var(--coesi-surface); }
+        button.primary {
+            background: var(--coesi-accent);
+            border-color: transparent;
+            color: #000;
+            font-weight: 700;
+            padding: 0 16px;
+        }
+        button.primary:hover { background: var(--coesi-accent-hover); }
+        button.secondary {
+            background: transparent;
+            border-color: var(--coesi-accent-soft);
+        }
+        button.secondary:hover { background: var(--coesi-accent-soft-bg); }
+        button.secondary.open { background: var(--coesi-accent-soft-bg); }
+        button.danger {
+            background: var(--coesi-danger-bg);
+            border-color: var(--coesi-danger);
+            color: var(--coesi-danger);
+            font-weight: 600;
+        }
+        button.danger:hover { background: var(--coesi-danger); color: #fff; }
+        /* "Connect" and "Disconnect" differ in width; a fixed width keeps the
+           transport controls from shifting when the label changes. */
+        #connectBtn { width: 104px; padding: 0; }
+
+        /* -- Inputs: MaterialTextField.tsx (outlined), react-select ------------ */
+        input, select {
+            height: 34px;
+            padding: 0 10px;
+            border: 1px solid var(--coesi-border-strong);
+            border-radius: 4px;
+            background: var(--coesi-surface);
+            color: var(--coesi-text-strong);
+            font-size: 13px;
+            outline: none;
+            transition: border-color .15s ease, box-shadow .15s ease;
+        }
+        input:focus, select:focus {
+            border-color: var(--coesi-success-text);
+            box-shadow: inset 0 0 0 1px var(--coesi-success-text);
+        }
+        input::placeholder { color: var(--coesi-text-faint); }
+        select { cursor: pointer; }
+        select:disabled { cursor: not-allowed; opacity: .55; }
+
+        /* -- Segmented control: headerProjects.tsx PillSegment (590-608) and
+              theme.css .coesi-seg (128-217). Used for the view tabs, the table
+              mode, the map data source, the chart range and the theme. -------- */
+        .seg {
+            display: inline-flex;
+            gap: 2px;
+            padding: 3px;
+            background: var(--coesi-surface-muted);
+            border: 1px solid var(--coesi-border);
+            border-radius: 10px;
+            flex-shrink: 0;
+        }
+        .seg button, .tab-btn, .range-btn {
+            height: auto;
+            min-height: 28px;
+            padding: 5px 10px;
+            border: 1px solid transparent;
+            border-radius: 7px;
+            background: transparent;
+            color: var(--coesi-text-muted);
+            font-size: 13px;
+            font-weight: 500;
+        }
+        .seg button:hover:not(.active), .tab-btn:hover:not(.active), .range-btn:hover:not(.active) {
+            background: var(--coesi-control-hover);
+        }
+        .seg button.active, .tab-btn.active, .range-btn.active {
+            background: var(--coesi-surface);
+            border-color: var(--coesi-border-strong);
+            color: var(--coesi-text-strong);
+            font-weight: 600;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
+        }
+        .tabs { display: inline-flex; gap: 2px; padding: 3px; background: var(--coesi-surface-muted);
+                border: 1px solid var(--coesi-border); border-radius: 10px; flex-shrink: 0; }
+        .range-toggle { display: inline-flex; gap: 2px; padding: 3px; background: var(--coesi-surface-muted);
+                        border: 1px solid var(--coesi-border); border-radius: 10px; flex-shrink: 0; }
+        .range-btn { padding: 3px 10px; font-size: 12px; min-height: 24px; }
+
+        /* -- Run readout (step / time) ---------------------------------------- */
+        /* -- Transport (play/pause/step, progress, pace) ----------------------- */
+        .transport {
+            display: flex;
+            align-items: center;
+            gap: 6px;
             white-space: nowrap;
         }
         .transport button {
             width: 34px;
-            padding: 6px 0;
-            text-align: center;
-            font-family: monospace;
-        }
-        .transport button:disabled {
-            background: var(--border);
-            color: var(--text-muted);
-            cursor: not-allowed;
-        }
-        .transport input[type=range] {
-            width: 190px;
+            flex: 0 0 34px;
             padding: 0;
-            accent-color: var(--primary);
-            background: transparent;
-            border: none;
+            text-align: center;
+            font-family: var(--proto-font-mono);
+            font-size: 13px;
         }
-        /* Read-only: the federation has no seek, so this is a progress indicator. */
-        .transport input[type=range] { pointer-events: none; cursor: default; }
-        .transport select {
-            padding: 5px 6px;
-            font-size: 0.78rem;
-            font-family: monospace;
-            cursor: pointer;
+        .transport #paceWrap { flex: 0 0 100px; }
+        .transport #paceBtn {
+            width: 100px;
+            flex: none;
+            font-family: inherit;
+            font-size: 12.5px;
+            text-align: left;
+            padding: 0 10px;
         }
-        .transport select:disabled { cursor: not-allowed; opacity: 0.5; }
-        .transport .scrub-label {
-            font-family: monospace;
-            font-size: 0.78rem;
-            color: var(--text-muted);
+        /* Rate reads as a run-state pill: SimulationPreview.tsx:763-769 colours */
+        .rate-label {
+            display: inline-block;
             min-width: 92px;
+            box-sizing: border-box;
+            font-family: var(--proto-font-mono);
+            font-variant-numeric: tabular-nums;
+            font-size: 11px;
+            font-weight: 600;
+            padding: 3px 8px;
+            border-radius: 20px;
+            text-align: center;
+            color: var(--proto-state-running);
+            background: var(--coesi-info-bg);
         }
-        .transport .rate-label {
-            font-family: monospace;
-            font-size: 0.72rem;
-            color: var(--text-muted);
-            min-width: 70px;
-        }
-        .transport .rate-label.finished { color: #fbbf24; }
+        .rate-label.paused { color: var(--proto-state-paused); background: var(--coesi-warning-bg); }
+        .rate-label.finished { color: var(--proto-state-done); background: var(--coesi-success-bg); }
+        .rate-label.idle { color: var(--coesi-text-muted); background: var(--coesi-surface-muted); }
 
-        .status {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            margin-left: auto;
-            font-size: 0.8rem;
-            white-space: nowrap;
-            position: relative;
-        }
-        .meta-badge {
-            font-family: monospace;
-            font-size: 0.75rem;
-            color: var(--text-muted);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 4px 8px;
-            cursor: default;
-            max-width: 230px;
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        .meta-badge:hover { border-color: var(--primary); color: var(--text-main); }
-        .meta-popover {
-            display: none;
-            position: absolute;
-            top: 30px;
-            right: 0;
-            z-index: 2000;
-            background: var(--bg-panel);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 10px 12px;
-            font-family: monospace;
-            font-size: 0.75rem;
-            line-height: 1.5;
-            color: var(--text-main);
-            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-            white-space: pre;
-            text-align: left;
-        }
-        .meta-badge:hover + .meta-popover, .meta-popover:hover { display: block; }
-        /* Connection config drop-down. Click-toggled, not hover like .meta-popover:
-           it holds inputs the user has to travel into and type in. */
-        .config { position: relative; flex-shrink: 0; }
-        .config button { white-space: nowrap; }
-        .config-popover {
-            display: none;
-            position: absolute;
-            top: 32px;
-            left: 0;
-            z-index: 2000;
-            background: var(--bg-panel);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 10px 12px;
-            box-shadow: 0 8px 24px rgba(0,0,0,0.5);
-            text-align: left;
-            width: 190px;
-        }
-        .config-popover.open { display: block; }
-        .config-popover label {
-            display: block;
-            font-size: 0.7rem;
-            text-transform: uppercase;
-            letter-spacing: 0.04em;
-            color: var(--text-muted);
-            margin-bottom: 3px;
-        }
-        .config-popover input {
-            display: block;
-            width: 100%;
-            box-sizing: border-box;   /* padding must not push the input past the panel */
-            margin-bottom: 8px;
-            font-size: 0.8rem;
-            padding: 5px 8px;
-        }
-        .config-popover input:last-child { margin-bottom: 0; }
-
+        /* -- Status (right edge): connection dot ------------------------------ */
+        .status { display: flex; align-items: center; padding-left: 2px; }
         .status-dot {
             width: 10px;
             height: 10px;
             border-radius: 50%;
-            background: #ef4444;
+            background: var(--proto-state-failed);
         }
         .status-dot.connected {
-            background: #10b981;
-            box-shadow: 0 0 8px #10b981;
+            background: var(--proto-state-done);
+            box-shadow: 0 0 0 3px var(--coesi-success-bg);
         }
 
-        /* Tabs Content */
+        @media (max-width: 1400px) { .brand-sub { display: none; } }
+        @media (max-width: 1100px) { .brand { display: none; } }
+
+        /* -- Dropdown panels: headerProjects.tsx:221-229, 266-271 ------------- */
+        .dropdown { position: relative; }
+        .dropdown-panel {
+            display: none;
+            position: absolute;
+            top: 40px;
+            left: 0;
+            z-index: 2000;
+            background: var(--coesi-surface);
+            border: 1px solid var(--coesi-border);
+            border-radius: 10px;
+            box-shadow: var(--coesi-shadow);
+            text-align: left;
+            color: var(--coesi-text);
+        }
+        .dropdown-panel.open { display: block; }
+        .dropdown-panel.menu { min-width: 150px; padding: 6px; }
+        .dropdown-panel.menu button {
+            display: block;
+            width: 100%;
+            height: auto;
+            padding: 8px 12px;
+            border: none;
+            border-radius: 7px;
+            background: transparent;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--coesi-text-secondary);
+        }
+        .dropdown-panel.menu button:hover { background: var(--coesi-surface-subtle); }
+        .dropdown-panel.menu button.active { background: var(--coesi-info-bg); color: var(--coesi-text-strong); font-weight: 600; }
+        .app-header button.open { background: var(--coesi-accent-soft-bg); }
+        /* Connection config drop-down. Click-toggled, not hover like .meta-popover:
+           it holds inputs the user has to travel into and type in. */
+        .config-popover { padding: 14px 16px; width: 240px; }
+        .config-popover label, .section-label {
+            display: block;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--coesi-text-muted);
+            margin-bottom: 4px;
+        }
+        .config-popover input {
+            display: block;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+        .config-popover .seg { display: flex; }
+        .config-popover .seg button { flex: 1; }
+        .config-note { font-size: 12px; color: var(--coesi-text-muted); margin: 0 0 10px; line-height: 1.4; }
+        .config-note.error { color: var(--coesi-danger); }
+
+        /* -- Tab content ------------------------------------------------------ */
         .tab-content {
             display: none;
             flex-grow: 1;
             overflow: auto;
             position: relative;
         }
-        .tab-content.active {
-            display: block;
-        }
+        .tab-content.active { display: block; }
 
-        /* Heatmap Grid */
-        .table-container {
-            padding: 20px;
-        }
+        /* -- Data table: InputEditor/Table.css (Tabulator look) ---------------- */
+        .table-container { padding: 20px; }
         .table-toolbar {
             display: flex;
             align-items: center;
@@ -272,183 +476,246 @@
             position: sticky;
             left: 20px;
             margin-bottom: 12px;
-            font-size: 0.8rem;
-            color: var(--text-muted);
+            font-size: 13px;
+            color: var(--coesi-text-muted);
         }
-
         table {
-            border-collapse: collapse;
+            border-collapse: separate;
+            border-spacing: 0;
             width: max-content;
-            font-size: 0.85rem;
+            font-size: 13px;
+            background: var(--coesi-surface);
+            border: 1px solid var(--coesi-border);
+            border-radius: 10px;
         }
-
         th, td {
-            border: 1px solid var(--border);
+            border-bottom: 1px solid var(--coesi-border);
+            border-right: 1px solid var(--coesi-divider);
             text-align: center;
-            padding: 8px;
+            padding: 8px 10px;
             min-width: 80px;
         }
-
+        /* Two sticky header rows. Their height is pinned so the second row's
+           `top` is exact — any mismatch shows scrolling cells through the gap. */
         th {
-            background: var(--bg-panel);
-            color: var(--text-muted);
+            height: 36px;
+            padding: 0 10px;
+            white-space: nowrap;
+            background: var(--coesi-surface-subtle);
+            color: var(--coesi-text-muted);
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: .2px;
             position: sticky;
             top: 0;
             z-index: 10;
         }
-        
         .th-model {
-            background: #273950;
-            color: #e2e8f0;
-            font-weight: bold;
-            text-transform: uppercase;
-            font-size: 0.8rem;
+            background: var(--coesi-surface-muted);
+            color: var(--coesi-text-secondary);
             top: 0;
             z-index: 20;
         }
-        
         .th-var {
-            top: 33px; /* height of model row */
-            font-size: 0.75rem;
-            font-family: monospace;
+            top: 36px;
+            font-family: var(--proto-font-mono);
+            text-transform: none;
+            letter-spacing: 0;
         }
-        
         .td-bui {
             position: sticky;
             left: 0;
-            background: var(--bg-panel);
-            font-weight: bold;
+            background: var(--coesi-surface);
+            color: var(--coesi-text-strong);
+            font-weight: 600;
             z-index: 5;
             text-align: left;
-            padding: 0 15px;
+            padding: 0 14px;
         }
-
+        tbody tr:hover td { background-color: var(--coesi-surface-muted); }
+        tbody tr:hover .td-bui { background: var(--coesi-surface-muted); }
         .val-cell {
-            font-family: monospace;
-            color: white;
-            text-shadow: 0 0 2px black;
-            transition: background-color 0.3s;
+            font-family: var(--proto-font-mono);
+            color: var(--coesi-text-strong);
+            transition: background-color .3s;
         }
 
-        /* Map UI */
-        #map-container {
-            position: absolute;
-            top: 0; left: 0; right: 0; bottom: 0;
-        }
+        /* -- Map ---------------------------------------------------------------- */
+        #map-container { position: absolute; top: 0; left: 0; right: 0; bottom: 0; }
         .map-overlay {
             position: absolute;
-            top: 15px;
-            left: 15px;
-            background: rgba(30, 41, 59, 0.9);
-            padding: 15px;
-            border-radius: 8px;
+            top: 16px;
+            left: 16px;
+            background: var(--coesi-surface);
+            padding: 14px 16px;
+            border: 1px solid var(--coesi-border);
+            border-radius: 10px;
+            box-shadow: var(--coesi-shadow);
             z-index: 10;
             display: flex;
             flex-direction: column;
-            gap: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
-            border: 1px solid var(--border);
+            gap: 12px;
         }
-
-        /* DeckGL Tooltip override */
-        .deck-tooltip {
-            background: rgba(15, 23, 42, 0.9) !important;
-            color: white !important;
-            border: 1px solid var(--border) !important;
-            border-radius: 4px !important;
-            font-family: monospace !important;
-            padding: 10px !important;
+        .map-overlay .row { display: flex; gap: 8px; }
+        .deck-tooltip, .map-tooltip {
+            background: var(--coesi-surface) !important;
+            color: var(--coesi-text) !important;
+            border: 1px solid var(--coesi-border) !important;
+            border-radius: 6px !important;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, .1) !important;
+            font-family: var(--proto-font-mono) !important;
+            font-size: 12px !important;
+            padding: 8px 10px !important;
             white-space: pre-wrap !important;
         }
+        .map-tooltip { display: none; position: absolute; z-index: 1000; pointer-events: none; }
 
-        /* Hidden Logs Panel */
-        .logs-panel {
+        /* -- Drawers: RightDrawerShell.tsx (overlay right drawer, 370px) ------- */
+        .drawer {
             position: fixed;
             top: 0;
             right: -400px;
-            width: 400px;
+            width: 370px;
             height: 100vh;
-            background: var(--bg-panel);
-            border-left: 1px solid var(--border);
-            transition: right 0.3s ease;
+            background: var(--coesi-surface-subtle);
+            border-left: 1px solid var(--coesi-border);
+            box-shadow: -4px 0 24px rgba(0, 0, 0, .15);
+            transition: right .3s ease;
             display: flex;
             flex-direction: column;
             z-index: 2000;
-            box-shadow: -5px 0 15px rgba(0,0,0,0.5);
         }
-        .logs-panel.open {
-            right: 0;
-        }
-        .logs-header {
-            padding: 15px;
-            border-bottom: 1px solid var(--border);
+        .drawer.open { right: 0; }
+        .drawer-header {
+            padding: 16px 24px;
+            border-bottom: 1px solid var(--coesi-border);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            font-weight: bold;
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--coesi-text-strong);
         }
+        .drawer-body {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 20px 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 22px;
+        }
+        .drawer-body section { display: flex; flex-direction: column; gap: 8px; }
+        .drawer-body .section-label { margin-bottom: 2px; }
+        .drawer-body input[type=range] {
+            width: 100%;
+            height: auto;
+            padding: 0;
+            border: none;
+            background: transparent;
+            accent-color: var(--coesi-tab-active-bg);
+            /* Read-only: the federation has no seek, so this is a progress indicator. */
+            pointer-events: none;
+            cursor: default;
+        }
+        .kv {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            font-size: 13px;
+            color: var(--coesi-text-muted);
+            border-bottom: 1px solid var(--coesi-divider);
+            padding: 4px 0;
+        }
+        .kv b {
+            font-family: var(--proto-font-mono);
+            font-variant-numeric: tabular-nums;
+            font-weight: 600;
+            color: var(--coesi-text-strong);
+        }
+        .meta-summary {
+            font-size: 13px;
+            color: var(--coesi-text-secondary);
+            line-height: 1.45;
+        }
+        .meta-detail {
+            margin: 0;
+            padding: 10px 12px;
+            background: var(--coesi-surface);
+            border: 1px solid var(--coesi-border);
+            border-radius: 8px;
+            font-family: var(--proto-font-mono);
+            font-size: 11.5px;
+            line-height: 1.5;
+            color: var(--coesi-text);
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .meta-detail:empty { display: none; }
         .logs-content {
             flex-grow: 1;
             overflow-y: auto;
-            padding: 15px;
-            font-family: monospace;
-            font-size: 0.8rem;
-            color: #a7f3d0;
+            padding: 12px 20px;
+            font-family: var(--proto-font-mono);
+            font-size: 12px;
+            color: var(--coesi-text-secondary);
         }
         .log-entry {
-            border-bottom: 1px solid rgba(255,255,255,0.05);
+            border-bottom: 1px solid var(--coesi-divider);
             padding: 4px 0;
             word-break: break-all;
         }
 
-        /* Live Chart + Sensors tabs — same shell, same chart machinery */
-        #tab-chart.active, #tab-sensors.active {
-            display: flex;
-            overflow: hidden;
-        }
+        /* -- Live Chart + Sensors: sidebar = InputEditor left drawer (320px),
+              same shell, same chart machinery ----------------------------------- */
+        #tab-chart.active, #tab-sensors.active { display: flex; overflow: hidden; }
         .chart-sidebar {
-            width: 260px;
+            width: 280px;
             flex-shrink: 0;
-            background: var(--bg-panel);
-            border-right: 1px solid var(--border);
+            background: var(--coesi-surface);
+            border-right: 1px solid var(--coesi-border);
             display: flex;
             flex-direction: column;
-            padding: 12px;
-            gap: 10px;
+            padding: 16px;
+            gap: 12px;
             overflow: hidden;
         }
         .chart-sidebar label {
-            font-size: 0.75rem;
-            color: var(--text-muted);
+            display: block;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--coesi-text-muted);
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            letter-spacing: 1.5px;
+            margin-bottom: 4px;
         }
-        .chart-sidebar input, .chart-sidebar select {
-            width: 100%;
-            box-sizing: border-box;
-            font-size: 0.85rem;
-        }
+        .chart-sidebar input, .chart-sidebar select { width: 100%; }
         .setpoint-panel {
-            border-top: 1px solid var(--border);
-            padding-top: 10px;
+            border-top: 1px solid var(--coesi-border);
+            padding-top: 12px;
             display: flex;
             flex-direction: column;
-            gap: 6px;
+            gap: 8px;
         }
         .setpoint-row { display: flex; gap: 6px; }
         .setpoint-row input { flex: 1; min-width: 0; }
-        .setpoint-row button { padding: 6px 10px; font-size: 0.8rem; }
-        .setpoint-status { font-size: 0.78rem; color: var(--text-muted); font-family: monospace; min-height: 1.1em; }
-        .setpoint-status.applied { color: #fbbf24; }
-        .setpoint-status.rejected { color: #f87171; }
-        .setpoint-active { font-size: 0.75rem; color: var(--text-muted); font-family: monospace; }
+        .setpoint-row button { padding: 0 10px; }
+        .setpoint-status {
+            font-size: 12px;
+            color: var(--coesi-text-muted);
+            font-family: var(--proto-font-mono);
+            min-height: 1.1em;
+        }
+        .setpoint-status.applied { color: var(--coesi-warning-text); }
+        .setpoint-status.rejected { color: var(--coesi-danger); }
+        .setpoint-active { font-size: 12px; color: var(--coesi-text-muted); font-family: var(--proto-font-mono); }
         .setpoint-active div { padding: 2px 0; }
         .building-list {
             flex-grow: 1;
             overflow-y: auto;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            background: var(--bg-dark);
+            border: 1px solid var(--coesi-border);
+            border-radius: 8px;
+            background: var(--coesi-surface-subtle);
             min-height: 80px;
         }
         .building-item {
@@ -456,20 +723,23 @@
             align-items: center;
             gap: 8px;
             padding: 6px 10px;
-            font-size: 0.85rem;
+            font-size: 13px;
+            color: var(--coesi-text-secondary);
             cursor: pointer;
-            border-bottom: 1px solid rgba(255,255,255,0.04);
+            border-bottom: 1px solid var(--coesi-divider);
             user-select: none;
         }
-        .building-item:hover { background: rgba(59, 130, 246, 0.1); }
-        .building-item.selected { background: rgba(59, 130, 246, 0.15); }
-        .building-item.disabled { opacity: 0.4; cursor: not-allowed; }
+        .building-item:hover { background: var(--coesi-surface-muted); }
+        .building-item.selected { background: var(--coesi-info-bg); color: var(--coesi-text-strong); }
+        .building-item.disabled { opacity: .4; cursor: not-allowed; }
+        .building-item input[type=checkbox] { height: auto; accent-color: var(--coesi-tab-active-bg); }
+        .list-hint { padding: 10px; color: var(--coesi-text-faint); font-size: 13px; }
         .bui-swatch {
             width: 12px;
             height: 12px;
             border-radius: 50%;
             flex-shrink: 0;
-            border: 1px solid var(--border);
+            border: 1px solid var(--coesi-border-strong);
             background: transparent;
         }
         .chart-main {
@@ -477,221 +747,196 @@
             display: flex;
             flex-direction: column;
             overflow: hidden;
-            padding: 12px 16px;
+            padding: 16px 20px;
         }
         .chart-header {
             display: flex;
             align-items: flex-start;
             gap: 12px;
-            padding: 4px 0 10px 0;
+            padding: 0 0 10px 0;
         }
         .chart-legend {
             display: flex;
             flex-wrap: wrap;
             gap: 6px 18px;
-            min-height: 22px;
+            min-height: 24px;
             flex-grow: 1;
         }
-        .range-toggle {
-            display: flex;
-            flex-shrink: 0;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            overflow: hidden;
-        }
-        .range-btn {
-            background: transparent;
-            color: var(--text-muted);
-            border: none;
-            border-radius: 0;
-            padding: 4px 10px;
-            font-size: 0.75rem;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        .range-btn + .range-btn { border-left: 1px solid var(--border); }
-        .range-btn.active {
-            background: var(--primary);
-            color: white;
-        }
-        .range-btn:hover:not(.active) { background: rgba(59, 130, 246, 0.1); }
         .legend-item {
             display: flex;
             align-items: center;
             gap: 7px;
-            font-size: 0.82rem;
-            color: var(--text-main);
+            font-size: 13px;
+            color: var(--coesi-text-secondary);
         }
-        .legend-key {
-            width: 14px;
-            height: 3px;
-            border-radius: 2px;
-            flex-shrink: 0;
-        }
-        .legend-val {
-            font-family: monospace;
-            color: var(--text-muted);
-        }
+        .legend-key { width: 14px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+        .legend-val { font-family: var(--proto-font-mono); color: var(--coesi-text-muted); }
         .chart-wrap {
             flex-grow: 1;
             position: relative;
             min-height: 0;
+            background: var(--coesi-surface);
+            border: 1px solid var(--coesi-border);
+            border-radius: 10px;
         }
-        .chart-svg {
-            width: 100%;
-            height: 100%;
-            display: block;
-        }
+        .chart-svg { width: 100%; height: 100%; display: block; }
         .chart-empty {
             position: absolute;
             inset: 0;
             display: flex;
             align-items: center;
             justify-content: center;
-            color: var(--text-muted);
-            font-size: 0.95rem;
+            color: var(--coesi-text-faint);
+            font-size: 14px;
             text-align: center;
             padding: 20px;
         }
+        /* Chart tooltip: SimulationResults.tsx Recharts contentStyle */
         .chart-tooltip {
             display: none;
             position: absolute;
             z-index: 100;
-            background: rgba(15, 23, 42, 0.95);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            font-family: monospace;
-            font-size: 0.78rem;
+            background: var(--coesi-surface);
+            border: 1px solid var(--coesi-border);
+            border-radius: 6px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, .1);
+            font-family: var(--proto-font-mono);
+            font-size: 12px;
+            color: var(--coesi-text);
             padding: 8px 10px;
             pointer-events: none;
             white-space: nowrap;
         }
         .tt-row { display: flex; align-items: center; gap: 6px; padding: 1px 0; }
         .tt-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+        .tt-muted { color: var(--coesi-text-muted); }
+        .tt-fault { color: var(--proto-fault); }
 
         /* Sensors tab: two rows rather than the chart tab's two columns. The top row is
            the selector sidebar + chart; the table spans the full width beneath both, so
            it gets the horizontal room its one-column-per-sensor-type header needs. */
         #tab-sensors.active { flex-direction: column; }
-        .sensor-top {
-            display: flex;
-            flex: 1 1 auto;
-            min-height: 0;
-            overflow: hidden;
-        }
+        .sensor-top { display: flex; flex: 1 1 auto; min-height: 0; overflow: hidden; }
         .sensor-table-wrap {
             flex: 0 0 auto;
             max-height: 38%;
-            overflow: auto;
-            border-top: 1px solid var(--border);
-            padding: 10px 16px 12px 16px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border-top: 1px solid var(--coesi-border);
+            background: var(--coesi-page-bg);
         }
-        .sensor-note {
-            font-size: 0.72rem;
-            color: var(--text-muted);
-            line-height: 1.5;
-        }
+        .sensor-table-wrap .row { display: flex; gap: 16px; align-items: center; flex-shrink: 0; padding: 12px 20px 8px; }
+        .sensor-table-scroll { overflow: auto; min-height: 0; padding: 0 20px 14px; }
+        .sensor-note { font-size: 12px; color: var(--coesi-text-muted); line-height: 1.5; }
         /* Status-aware cells: a dropout must never look like a measured value,
            and a fault must never look like a trustworthy one. */
         .val-cell.cell-nodata {
-            color: var(--text-muted);
+            color: var(--coesi-text-faint);
             font-style: italic;
             background-color: transparent !important;
         }
         .val-cell.cell-fault {
-            outline: 2px solid #f59e0b;
+            outline: 2px solid var(--proto-fault);
             outline-offset: -2px;
-            color: #fde68a;
+            color: var(--coesi-warning-text);
         }
         /* Reading time under each sensor value — a sensor log is a record of
            instants, so the time is part of the reading, not just a tooltip. */
         .cell-sub {
             display: block;
-            font-size: 0.68rem;
-            color: var(--text-muted);
-            font-family: monospace;
+            font-size: 10.5px;
+            color: var(--coesi-text-muted);
+            font-family: var(--proto-font-mono);
             margin-top: 2px;
-            text-shadow: none;
         }
-        .val-cell.cell-fault .cell-sub { color: #fcd34d; }
-
-        .status-key {
-            display: flex;
-            align-items: center;
-            gap: 5px;
-            font-size: 0.72rem;
-            color: var(--text-muted);
-        }
+        .val-cell.cell-fault .cell-sub { color: var(--coesi-warning-text); }
+        .status-key { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--coesi-text-muted); }
         .status-swatch {
             width: 11px;
             height: 11px;
             border-radius: 3px;
             flex-shrink: 0;
-            border: 1px solid var(--border);
+            border: 1px solid var(--coesi-border-strong);
         }
+        .swatch-ok { background: rgba(var(--proto-heat-pos-rgb), .6); }
+        .swatch-fault { border-color: var(--proto-fault); background: transparent; }
+        .swatch-nodata { background: rgb(var(--proto-nodata-rgb)); }
 
         ::-webkit-scrollbar { width: 8px; height: 8px; }
         ::-webkit-scrollbar-track { background: transparent; }
-        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
-        ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+        ::-webkit-scrollbar-thumb { background: var(--coesi-border-strong); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--coesi-text-faint); }
+
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after { transition: none !important; }
+        }
     </style>
 </head>
 <body>
 
-<div class="top-bar">
-    <div class="tabs">
-        <button id="btnTabTable" class="tab-btn active" onclick="switchTab('table')">Data Table</button>
+<div class="app-header">
+    <div class="brand">
+        <span class="brand-mark">C</span>
+        COESI <span class="brand-sub">Live simulation</span>
+    </div>
+
+    <div class="tabs" role="tablist">
+        <button id="btnTabTable" class="tab-btn active" onclick="switchTab('table')">Table</button>
         <button id="btnTabMap" class="tab-btn" onclick="switchTab('map')">3D Map</button>
-        <button id="btnTabChart" class="tab-btn" onclick="switchTab('chart')">Live Chart</button>
+        <button id="btnTabChart" class="tab-btn" onclick="switchTab('chart')">Chart</button>
         <button id="btnTabSensors" class="tab-btn" onclick="switchTab('sensors')">Sensors</button>
     </div>
 
-    <div class="config" id="configWrap">
+    <div class="config dropdown" id="configWrap">
         <button class="secondary" id="configBtn" onclick="toggleConfig(event)"
-                title="Broker address and subscription topic">Config ▾</button>
-        <div class="config-popover" id="configPopover">
-            <label for="host">Broker IP</label>
-            <input type="text" id="host" value="127.0.0.1" placeholder="Broker IP">
-            <label for="port">Port</label>
-            <input type="number" id="port" value="9001" placeholder="Port">
+                title="Broker address, subscription topic and theme">Config ▾</button>
+        <div class="config-popover dropdown-panel" id="configPopover">
+            <p class="config-note" id="configNote">Loading /config.json…</p>
+            <label for="host">Broker host</label>
+            <input type="text" id="host" placeholder="from .env: MQTT_WS_HOST" autocomplete="off">
+            <label for="port">WebSocket port</label>
+            <input type="number" id="port" placeholder="from .env: MQTT_WS_PORT">
             <label for="topic">Topic</label>
-            <input type="text" id="topic" value="sim/coesi5/#" placeholder="Topic">
+            <input type="text" id="topic" placeholder="from .env: TOPIC" autocomplete="off">
+            <label>Theme</label>
+            <div class="seg" id="themeSeg">
+                <button id="themeAuto" onclick="setThemeMode('auto')">Auto</button>
+                <button id="themeLight" onclick="setThemeMode('light')">Light</button>
+                <button id="themeDark" onclick="setThemeMode('dark')">Dark</button>
+            </div>
         </div>
     </div>
-    <button id="connectBtn" onclick="toggleConnection()">Connect</button>
-    
-    <div class="global-stats">
-        <div>Step: <span id="lblStep">0</span></div>
-        <div>Time: <span id="lblTime">0.00</span></div>
-    </div>
+    <button id="connectBtn" class="primary" onclick="toggleConnection()" disabled>Connect</button>
 
+    <!-- Transport controls only; the readouts (step, time, progress, run
+         metadata) live in the Run drawer so the bar keeps a fixed geometry. -->
     <div class="transport">
         <button id="btnPlayPause" onclick="togglePlayback()" disabled title="Pause / resume the run">❚❚</button>
         <button id="btnStep" onclick="stepOnce()" disabled title="Advance exactly one step (while paused)">⏭</button>
-        <input type="range" id="scrubber" min="0" max="0" value="0" step="1" tabindex="-1"
-               title="Run position (read-only)">
-        <span class="scrub-label" id="lblScrub" title="">– / –</span>
-        <select id="paceSelect" onchange="onPaceChange()" disabled title="Pace: simulated time per real second">
-            <option value="1">1 s/s (real time)</option>
-            <option value="60">1 min/s</option>
-            <option value="600" selected>10 min/s</option>
-            <option value="3600">1 h/s</option>
-            <option value="21600">6 h/s</option>
-            <option value="86400">1 day/s</option>
-            <option value="0">Free-run</option>
-        </select>
-        <span class="rate-label" id="lblRate" title="Actual rate the engine is achieving">–</span>
+        <div class="dropdown" id="paceWrap">
+            <button id="paceBtn" onclick="togglePace(event)" disabled title="Pace: simulated time per real second">10 min/s ▾</button>
+            <div class="dropdown-panel menu" id="paceMenu"></div>
+            <!-- State holder: applyTransportState/onPaceChange read and write this. -->
+            <select id="paceSelect" onchange="onPaceChange()" hidden>
+                <option value="1">real time</option>
+                <option value="60">1 min/s</option>
+                <option value="600" selected>10 min/s</option>
+                <option value="3600">1 h/s</option>
+                <option value="21600">6 h/s</option>
+                <option value="86400">1 day/s</option>
+                <option value="0">free-run</option>
+            </select>
+        </div>
     </div>
 
-    <div style="flex-grow: 1;"></div>
+    <div class="header-spacer"></div>
 
-    <button class="secondary" onclick="toggleLogs()">Raw Logs</button>
+    <button class="secondary" id="runBtn" onclick="toggleDrawer('runPanel')" title="Step, time, progress and run metadata">Run info</button>
+    <button class="secondary" id="logsBtn" onclick="toggleDrawer('logsPanel')" title="Raw MQTT messages">Logs</button>
 
     <div class="status">
-        <span class="meta-badge" id="metaBadge">no run metadata</span>
-        <div class="meta-popover" id="metaPopover"></div>
-        <span id="statusText">Disconnected</span>
-        <div id="statusDot" class="status-dot"></div>
+        <div id="statusDot" class="status-dot" title="Disconnected"></div>
     </div>
 </div>
 
@@ -699,7 +944,7 @@
 <div id="tab-table" class="tab-content active">
     <div class="table-container">
         <div class="table-toolbar">
-            <span>Show:</span>
+            <span>Show</span>
             <div class="range-toggle">
                 <button id="tableModeLast" class="range-btn active" onclick="setTableMode('last')">Last value</button>
                 <button id="tableModeMax" class="range-btn" onclick="setTableMode('max')">Max value</button>
@@ -716,28 +961,28 @@
 <div id="tab-map" class="tab-content">
     <div id="map-container"></div>
     <!-- Custom Tooltip for live updates -->
-    <div id="custom-tooltip" style="display: none; position: absolute; z-index: 1000; background: rgba(15, 23, 42, 0.9); color: white; border: 1px solid var(--border); border-radius: 4px; font-family: monospace; padding: 10px; white-space: pre-wrap; pointer-events: none;"></div>
-    
+    <div id="custom-tooltip" class="map-tooltip"></div>
+
     <div class="map-overlay">
-        <div style="display: flex; gap: 8px;">
-            <input type="text" id="projectIdInput" placeholder="Project ID" value="ee0520bb-2314-4c8a-a83b-67aec32b5caa" style="width: 300px;">
+        <div class="row">
+            <input type="text" id="projectIdInput" placeholder="Project ID" style="width: 300px;" autocomplete="off">
             <button onclick="loadGeoJsonMap()">Load Map</button>
         </div>
         <div>
-            <label style="font-size: 0.85rem; color: var(--text-muted); display: block; margin-bottom: 4px;">Data source:</label>
-            <div class="range-toggle" style="width: fit-content;">
+            <span class="section-label">Data source</span>
+            <div class="range-toggle">
                 <button id="mapModeTruth" class="range-btn active" onclick="setMapMode('truth')">Ground truth</button>
                 <button id="mapModeSensor" class="range-btn" onclick="setMapMode('sensor')">Sensor reading</button>
             </div>
         </div>
         <div>
-            <label style="font-size: 0.85rem; color: var(--text-muted); display: block; margin-bottom: 4px;">Color by Parameter:</label>
+            <span class="section-label">Colour by parameter</span>
             <select id="mapParameterSelect" style="width: 100%;" onchange="updateDeckGl()">
                 <option value="">-- None --</option>
             </select>
         </div>
         <div id="mapSensorKey" style="display: none;" class="status-key">
-            <span class="status-swatch" style="background: rgb(148,163,184);"></span>
+            <span class="status-swatch swatch-nodata"></span>
             <span>flat grey = no current sensor reading (never reported, or dropout)</span>
         </div>
     </div>
@@ -747,15 +992,15 @@
 <div id="tab-chart" class="tab-content">
     <div class="chart-sidebar">
         <div>
-            <label>Search buildings</label>
+            <label for="buildingSearch">Search buildings</label>
             <input type="text" id="buildingSearch" placeholder="e.g. bui_0037" oninput="renderBuildingList('sim')">
         </div>
-        <label style="margin-bottom: -6px;">Buildings (max 8)</label>
+        <label style="margin-bottom: -8px;">Buildings (max 8)</label>
         <div class="building-list" id="buildingList">
-            <div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">Waiting for MQTT data...</div>
+            <div class="list-hint">Waiting for MQTT data...</div>
         </div>
         <div>
-            <label>Shared parameter</label>
+            <label for="chartParameterSelect">Shared parameter</label>
             <select id="chartParameterSelect" onchange="onChartParamChange('sim')">
                 <option value="">-- Select parameter --</option>
             </select>
@@ -772,8 +1017,8 @@
             </select>
             <div class="setpoint-row">
                 <input type="number" id="setpointValue" step="any" placeholder="value">
-                <button id="setpointApply" onclick="applySetpoint()" disabled>Apply</button>
-                <button id="setpointClear" class="secondary" onclick="clearSetpoint()" disabled>Clear</button>
+                <button id="setpointApply" class="primary" onclick="applySetpoint()" disabled>Apply</button>
+                <button id="setpointClear" onclick="clearSetpoint()" disabled>Clear</button>
             </div>
             <div class="setpoint-status" id="setpointStatus">Waiting for data…</div>
             <div class="setpoint-active" id="setpointActive"></div>
@@ -796,20 +1041,20 @@
 </div>
 
 <!-- TAB: SENSORS — same sidebar + chart machinery as Live Chart, pointed at the
-     sensors/# namespace instead of sim/coesi5/#. -->
+     sensors namespace instead of the simulation topic. -->
 <div id="tab-sensors" class="tab-content">
     <div class="sensor-top">
         <div class="chart-sidebar">
             <div>
-                <label>Search buildings</label>
+                <label for="sensorBuildingSearch">Search buildings</label>
                 <input type="text" id="sensorBuildingSearch" placeholder="e.g. bui_0037 or site" oninput="renderBuildingList('sensor')">
             </div>
-            <label style="margin-bottom: -6px;">Buildings (max 8)</label>
+            <label style="margin-bottom: -8px;">Buildings (max 8)</label>
             <div class="building-list" id="sensorBuildingList">
-                <div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">Waiting for sensor data...</div>
+                <div class="list-hint">Waiting for sensor data...</div>
             </div>
             <div>
-                <label>Sensor type</label>
+                <label for="sensorParameterSelect">Sensor type</label>
                 <select id="sensorParameterSelect" onchange="onChartParamChange('sensor')">
                     <option value="">-- Select sensor --</option>
                 </select>
@@ -833,31 +1078,138 @@
         </div>
     </div>
     <div class="sensor-table-wrap">
-        <div style="display: flex; gap: 16px; align-items: center; margin-bottom: 8px;">
+        <div class="row">
             <span class="sensor-note"><b>Latest reading per building</b></span>
-            <span class="status-key"><span class="status-swatch" style="background: rgba(239,68,68,0.6);"></span>ok</span>
-            <span class="status-key"><span class="status-swatch" style="border-color: #f59e0b; background: transparent;"></span>fault (untrustworthy value)</span>
-            <span class="status-key"><span class="status-swatch" style="background: transparent;"></span>— = dropout / never reported</span>
+            <span class="status-key"><span class="status-swatch swatch-ok"></span>ok</span>
+            <span class="status-key"><span class="status-swatch swatch-fault"></span>fault (untrustworthy value)</span>
+            <span class="status-key"><span class="status-swatch"></span>— = dropout / never reported</span>
         </div>
-        <table id="sensorTable">
-            <thead id="sensorTableHead"></thead>
-            <tbody id="sensorTableBody"></tbody>
-        </table>
+        <!-- The legend stays put; only this inner box scrolls, so the sticky
+             header rows pin to its top edge with nothing above them. -->
+        <div class="sensor-table-scroll">
+            <table id="sensorTable">
+                <thead id="sensorTableHead"></thead>
+                <tbody id="sensorTableBody"></tbody>
+            </table>
+        </div>
     </div>
 </div>
 
-<!-- Logs Panel -->
-<div class="logs-panel" id="logsPanel">
-    <div class="logs-header">
-        Raw MQTT Messages
-        <button class="secondary" style="padding: 4px 8px; font-size: 0.8rem;" onclick="toggleLogs()">Close</button>
+<!-- Run drawer: RightDrawerShell.tsx look. Holds every readout so the top
+     bar only carries controls. Element ids are unchanged, so the transport
+     and metadata code writes into them exactly as before. -->
+<div class="drawer" id="runPanel">
+    <div class="drawer-header">
+        Run
+        <button onclick="toggleDrawer('runPanel')">Close</button>
+    </div>
+    <div class="drawer-body">
+        <section>
+            <span class="section-label">State</span>
+            <span class="rate-label idle" id="lblRate" title="Actual rate the engine is achieving">–</span>
+        </section>
+        <section>
+            <span class="section-label">Progress</span>
+            <input type="range" id="scrubber" min="0" max="0" value="0" step="1" tabindex="-1"
+                   title="Run position (read-only)">
+            <div class="kv"><span>Step</span><b id="lblStep">0</b></div>
+            <div class="kv"><span>Position</span><b id="lblScrub" title="">–</b></div>
+            <div class="kv"><span>Simulated time</span><b id="lblTime">0d 00:00</b></div>
+        </section>
+        <section>
+            <span class="section-label">Run metadata</span>
+            <div class="meta-summary" id="metaBadge">no run metadata</div>
+            <pre class="meta-detail" id="metaPopover"></pre>
+        </section>
+    </div>
+</div>
+
+<!-- Logs drawer -->
+<div class="drawer" id="logsPanel">
+    <div class="drawer-header">
+        Raw MQTT messages
+        <button onclick="toggleDrawer('logsPanel')">Close</button>
     </div>
     <div class="logs-content" id="logsContent">
-        <div style="color: var(--text-muted);">Waiting for messages...</div>
+        <div class="list-hint">Waiting for messages...</div>
     </div>
 </div>
 
 <script>
+    // --- Theme ---
+    // Reads the design tokens the CSS defines, so every colour the script draws
+    // (chart, heat ramp, map layers) follows the theme with no literal in here.
+    // Mirrors coesi-frontend-main's ThemeContext: same localStorage key, same
+    // <html data-theme>, so the choice carries across the two apps.
+    const THEME_KEY = 'coesi.theme';
+    const tokenCache = {};
+    function tokens(name) {
+        if (!(name in tokenCache)) {
+            tokenCache[name] = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        }
+        return tokenCache[name];
+    }
+    function tokenRgb(name) { return tokens(name).split(',').map(Number); }
+    function hexRgb(hex) { const n = parseInt(hex.slice(1), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; }
+    function tokenString(name) { return tokens(name).replace(/^["']|["']$/g, ''); }
+
+    function themeMode() {
+        try { return localStorage.getItem(THEME_KEY) || 'auto'; } catch (e) { return 'auto'; }
+    }
+    function resolvedTheme(mode) {
+        return mode === 'dark' || (mode === 'auto' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+            ? 'dark' : 'light';
+    }
+    function setThemeMode(mode) {
+        try { localStorage.setItem(THEME_KEY, mode); } catch (e) {}
+        applyTheme();
+    }
+    function applyTheme() {
+        const mode = themeMode();
+        document.documentElement.setAttribute('data-theme', resolvedTheme(mode));
+        for (const [m, id] of Object.entries({ auto: 'themeAuto', light: 'themeLight', dark: 'themeDark' })) {
+            document.getElementById(id).classList.toggle('active', m === mode);
+        }
+        for (const k of Object.keys(tokenCache)) delete tokenCache[k];
+        // Everything the script painted itself is repainted from the new tokens.
+        if (typeof renderChart === 'function') { renderChart('sim'); renderChart('sensor'); }
+        if (typeof renderBuildingList === 'function') { renderBuildingList('sim'); renderBuildingList('sensor'); }
+        if (typeof scheduleRender === 'function') scheduleRender();
+        if (mapInstance) mapInstance.setProps({ mapStyle: tokenString('--proto-map-style') });
+    }
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+        if (themeMode() === 'auto') applyTheme();
+    });
+
+    // --- Browser-side configuration ---
+    // The page has no defaults of its own: local_server.py serves /config.json
+    // from the same .env every other process reads, so the dashboard can never
+    // point at a different broker or topic than the bridge publishes to.
+    const appConfig = { loaded: false, sensorsTopic: null, urbansimApiBase: null };
+    async function loadConfig() {
+        const note = document.getElementById('configNote');
+        try {
+            const res = await fetch('/config.json', { cache: 'no-store' });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const cfg = await res.json();
+            document.getElementById('host').value = cfg.mqttHost;
+            document.getElementById('port').value = cfg.mqttPort;
+            document.getElementById('topic').value = `${cfg.topic}/#`;
+            document.getElementById('projectIdInput').value = cfg.urbansimProjectId || '';
+            appConfig.sensorsTopic = cfg.sensorsTopic;
+            SENSOR_BASE = cfg.sensorsTopic;
+            appConfig.urbansimApiBase = cfg.urbansimApiBase;
+            appConfig.loaded = true;
+            note.textContent = 'From .env via local_server.py';
+            note.classList.remove('error');
+            document.getElementById('connectBtn').disabled = false;
+        } catch (e) {
+            note.textContent = `Configuration unavailable (${e.message}). Serve the page with local_server.py, which reads .env.`;
+            note.classList.add('error');
+            document.getElementById('statusDot').title = 'No configuration';
+        }
+    }
+
     // --- UI Logic ---
     const TABS = { table: 'btnTabTable', map: 'btnTabMap', chart: 'btnTabChart', sensors: 'btnTabSensors' };
     let activeTab = 'table';
@@ -883,26 +1235,32 @@
         }
     }
 
-    function toggleLogs() {
-        const panel = document.getElementById('logsPanel');
-        panel.classList.toggle('open');
-        if (panel.classList.contains('open')) {
-            updateUI(); // force render of logs
+    // One drawer at a time; the button that opened it shows the open state.
+    const DRAWERS = { runPanel: 'runBtn', logsPanel: 'logsBtn' };
+    function toggleDrawer(id) {
+        const opening = !document.getElementById(id).classList.contains('open');
+        for (const [panel, btn] of Object.entries(DRAWERS)) {
+            const open = opening && panel === id;
+            document.getElementById(panel).classList.toggle('open', open);
+            document.getElementById(btn).classList.toggle('open', open);
         }
+        if (opening && id === 'logsPanel') updateUI(); // force render of logs
     }
+    function toggleLogs() { toggleDrawer('logsPanel'); }
 
     // Config drop-down: the broker host/port/topic inputs live behind a button so the
     // top bar keeps its width for the transport controls. Closing on any outside click
     // keeps it out of the way once the connection is set — which is nearly always.
     function toggleConfig(ev) {
         if (ev) ev.stopPropagation();
-        document.getElementById('configPopover').classList.toggle('open');
+        closeDropdowns('configPopover');
+        const open = document.getElementById('configPopover').classList.toggle('open');
+        document.getElementById('configBtn').classList.toggle('open', open);
     }
     document.addEventListener('click', (ev) => {
-        const wrap = document.getElementById('configWrap');
-        if (wrap && !wrap.contains(ev.target)) {
-            document.getElementById('configPopover').classList.remove('open');
-        }
+        const inConfig = document.getElementById('configWrap').contains(ev.target);
+        const inPace = document.getElementById('paceWrap').contains(ev.target);
+        if (!inConfig && !inPace) closeDropdowns();
     });
 
     // --- MQTT Logic ---
@@ -945,7 +1303,7 @@
     // --- Sensor state (sensors/# namespace) ---
     // Deliberately separate from dataStore: sensor readings carry a status and a
     // nullable value, and must never be mistaken for ground truth.
-    const SENSOR_BASE = 'sensors';
+    let SENSOR_BASE = null;             // SENSORS_TOPIC, from /config.json
     let sensorMeta = null;              // retained sensors/_meta/sensors payload
     let sensorTypeInfo = {};            // type -> { unit, per_building, ... } from the meta
     let sensorBuildings = new Set();    // clean bui_NNNN_N ids (plus the site pseudo-building)
@@ -981,7 +1339,7 @@
         const topic = document.getElementById('topic').value.trim();
         const clientId = "heatmap_" + Math.random().toString(16).substr(2, 8);
 
-        document.getElementById('statusText').innerText = 'Connecting...';
+        document.getElementById('statusDot').title = 'Connecting…';
         
         client = new Paho.MQTT.Client(host, port, "/mqtt", clientId);
         client.onConnectionLost = onConnectionLost;
@@ -992,11 +1350,11 @@
             onSuccess: () => {
                 isConnected = true;
                 document.getElementById('statusDot').classList.add('connected');
-                document.getElementById('statusText').innerText = 'Connected';
+                document.getElementById('statusDot').title = 'Connected';
                 const btn = document.getElementById('connectBtn');
                 btn.innerText = 'Disconnect';
                 btn.classList.add('danger');
-                btn.classList.remove('secondary');
+                btn.classList.remove('primary');
                 
                 client.subscribe(topic);
                 // The retained sim/coesi5/_meta/run arrives on this subscribe if
@@ -1014,7 +1372,7 @@
                 onSetpointTargetChange();
             },
             onFailure: (err) => {
-                document.getElementById('statusText').innerText = 'Failed';
+                document.getElementById('statusDot').title = 'Connection failed';
                 alert("Connection failed: " + (err.errorMessage || "Unknown"));
             }
         });
@@ -1028,10 +1386,12 @@
         setTransportEnabled(false);
         onSetpointTargetChange();
         document.getElementById('statusDot').classList.remove('connected');
-        document.getElementById('statusText').innerText = 'Disconnected';
+        document.getElementById('statusDot').title = 'Disconnected';
         const btn = document.getElementById('connectBtn');
         btn.innerText = 'Connect';
         btn.classList.remove('danger');
+        btn.classList.add('primary');
+        updateTransportUI();
     }
 
     function onConnectionLost(res) {
@@ -1070,7 +1430,53 @@
     function setTransportEnabled(enabled) {
         document.getElementById('btnPlayPause').disabled = !enabled;
         document.getElementById('paceSelect').disabled = !enabled;
+        document.getElementById('paceBtn').disabled = !enabled;
         document.getElementById('btnStep').disabled = !enabled || isPlaying;
+    }
+
+    // Pace dropdown: a panel styled like Config over the hidden <select> that
+    // holds the value (applyTransportState and onPaceChange keep using it).
+    function paceOptions() { return Array.from(document.getElementById('paceSelect').options); }
+    function syncPaceButton() {
+        const sel = document.getElementById('paceSelect');
+        const cur = paceOptions().find(o => o.value === sel.value);
+        document.getElementById('paceBtn').innerText = `${cur ? cur.text : '–'} ▾`;
+        document.querySelectorAll('#paceMenu button').forEach(b => {
+            b.classList.toggle('active', b.dataset.value === sel.value);
+        });
+    }
+    function buildPaceMenu() {
+        const menu = document.getElementById('paceMenu');
+        menu.innerHTML = '';
+        paceOptions().forEach(o => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.dataset.value = o.value;
+            b.innerText = o.text;
+            b.onclick = () => choosePace(o.value);
+            menu.appendChild(b);
+        });
+        syncPaceButton();
+    }
+    function togglePace(ev) {
+        if (ev) ev.stopPropagation();
+        closeDropdowns('paceMenu');
+        const open = document.getElementById('paceMenu').classList.toggle('open');
+        document.getElementById('paceBtn').classList.toggle('open', open);
+    }
+    function choosePace(value) {
+        document.getElementById('paceSelect').value = value;
+        onPaceChange();
+        syncPaceButton();
+        closeDropdowns();
+    }
+    // Only one header dropdown open at a time; `except` keeps that one as is.
+    function closeDropdowns(except) {
+        for (const [panel, btn] of [['configPopover', 'configBtn'], ['paceMenu', 'paceBtn']]) {
+            if (panel === except) continue;
+            document.getElementById(panel).classList.remove('open');
+            document.getElementById(btn).classList.remove('open');
+        }
     }
 
     // The button asks for the opposite of the broker's state and shows the
@@ -1161,9 +1567,9 @@
         const pct = totalSteps ? Math.round(100 * currentStep / (totalSteps - 1)) : null;
         const ts = simTimeOfStep(currentStep);
         if (ts !== null) {
-            lbl.innerText = `${fmtDayClock(ts)} · ${pct}%`;
+            lbl.innerText = fmtDayClock(ts);
             const end = runMeta.end_time ? Date.parse(runMeta.end_time) : NaN;
-            lbl.title = `step ${currentStep} / ${totalSteps - 1}` +
+            lbl.title = `step ${currentStep} / ${totalSteps - 1} (${pct}%)` +
                 (Number.isNaN(end) ? '' : ` — ${fmtFullTime(ts)} → ${fmtFullTime(end)}`) +
                 (runPass ? ` — pass ${runPass + 1}` : '');
         } else {
@@ -1171,10 +1577,16 @@
             lbl.title = '';
         }
 
+        syncPaceButton();
+        // The rate label doubles as the run-state pill: idle / running / paused / finished.
         const rate = document.getElementById('lblRate');
-        rate.classList.toggle('finished', runFinished);
-        if (runFinished) rate.innerText = 'finished';
-        else if (!isPlaying) rate.innerText = 'paused';
+        const state = !isConnected ? 'idle' : runFinished ? 'finished' : !isPlaying ? 'paused' : 'running';
+        rate.classList.toggle('idle', state === 'idle');
+        rate.classList.toggle('paused', state === 'paused');
+        rate.classList.toggle('finished', state === 'finished');
+        if (state === 'idle') rate.innerText = '–';
+        else if (state === 'finished') rate.innerText = 'finished';
+        else if (state === 'paused') rate.innerText = 'paused';
         else {
             const r = actualStepsPerSecond();
             rate.innerText = r === null ? (runMode === 'free' ? 'free-run' : '–') : `${r.toFixed(1)} step/s`;
@@ -1379,6 +1791,15 @@
         return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
     }
 
+    // Simulation time as elapsed days and clock, fixed width: "30d 00:00".
+    function fmtElapsed(seconds) {
+        const total = Math.max(0, Math.floor(seconds));
+        const d = Math.floor(total / 86400);
+        const h = Math.floor((total % 86400) / 3600);
+        const m = Math.floor((total % 3600) / 60);
+        return `${d}d ${pad2(h)}:${pad2(m)}`;
+    }
+
     function fmtDayClock(ms) {
         const d = new Date(ms);
         return `${MONTH_NAMES[d.getMonth()]} ${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
@@ -1473,7 +1894,7 @@
 
     function updateUI() {
         document.getElementById('lblStep').innerText = currentStep;
-        document.getElementById('lblTime').innerText = typeof currentTime === 'number' ? currentTime.toFixed(2) : currentTime;
+        document.getElementById('lblTime').innerText = typeof currentTime === 'number' ? fmtElapsed(currentTime) : String(currentTime);
         updateTransportUI();
 
         const logsPanel = document.getElementById('logsPanel');
@@ -1587,7 +2008,8 @@
     // tables and the map share.
     function heatColor(val, max) {
         const intensity = Math.min(Math.abs(val) / (max || 1), 1.0);
-        return val >= 0 ? `rgba(239, 68, 68, ${intensity})` : `rgba(59, 130, 246, ${intensity})`;
+        const rgb = tokens(val >= 0 ? '--proto-heat-pos-rgb' : '--proto-heat-neg-rgb');
+        return `rgba(${rgb}, ${intensity})`;
     }
 
     function fmtCellNumber(val) {
@@ -1800,9 +2222,9 @@
         const pid = document.getElementById('projectIdInput').value.trim();
         if (!pid) return alert("Please enter a Project ID");
 
-        // The frontend uses http://eclab-cloud3.polito.it:8001/api/v1/vector/get_buildings_geojson/{pid}/{pid}
-        // Wrapped with a local python CORS proxy because corsproxy.io timed out (522) trying to reach the internal server
-        const targetUrl = `http://eclab-cloud3.polito.it:8001/api/v1/vector/get_buildings_geojson/${pid}/${pid}`;
+        if (!appConfig.loaded) return alert("Configuration not loaded — the UrbanSim API base comes from .env via local_server.py.");
+        // Same endpoint the frontend uses, through local_server.py's CORS proxy.
+        const targetUrl = `${appConfig.urbansimApiBase}/api/v1/vector/get_buildings_geojson/${pid}/${pid}`;
         // Relative, so the page works from whatever host/port it was served on.
         const url = `/proxy/${encodeURIComponent(targetUrl)}`;
         
@@ -1845,9 +2267,9 @@
             wireframe: true,
             getElevation: f => f.properties.height || 10,
             getFillColor: f => {
-                if (!selectedParam) return [100, 116, 139, 150]; // Slate gray
+                if (!selectedParam) return [...tokenRgb('--proto-nodata-rgb'), 150];
                 const bName = f.properties.building_name; // e.g. "BUI-0037"
-                if (!bName) return [50, 50, 50, 100];
+                if (!bName) return [...tokenRgb('--proto-nodata-rgb'), 100];
 
                 if (mapDataMode === 'sensor') return sensorFillColor(bName, selectedParam);
 
@@ -1855,20 +2277,17 @@
                 const targetBuilding = matchBuildingId(bName, buildings);
 
                 if (!targetBuilding || !dataStore[targetBuilding] || !dataStore[targetBuilding][model] || dataStore[targetBuilding][model][variable] === undefined) {
-                    return [50, 50, 50, 100]; // Dark gray if no data
+                    return [...tokenRgb('--proto-nodata-rgb'), 100]; // no data
                 }
 
                 const val = dataStore[targetBuilding][model][variable];
                 const max = maxVals[variable] || 1;
                 const intensity = Math.min(Math.abs(val) / max, 1.0);
 
-                if (val >= 0) {
-                    return [239, 68, 68, intensity * 255]; // Red
-                } else {
-                    return [59, 130, 246, intensity * 255]; // Blue
-                }
+                const rgb = tokenRgb(val >= 0 ? '--proto-heat-pos-rgb' : '--proto-heat-neg-rgb');
+                return [...rgb, intensity * 255];
             },
-            getLineColor: [255, 255, 255, 100],
+            getLineColor: [...tokenRgb('--proto-map-outline-rgb'), 100],
             pickable: true,
             updateTriggers: {
                 getFillColor: [selectedParam, mapDataMode, mapUpdateToken] // Triggers redraw on new mqtt data
@@ -1879,7 +2298,7 @@
             const center = getFeatureCenter(geojsonData);
             mapInstance = new DeckGL({
                 container: 'map-container',
-                mapStyle: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+                mapStyle: tokenString('--proto-map-style'),
                 initialViewState: {
                     longitude: center.lon,
                     latitude: center.lat,
@@ -1904,7 +2323,7 @@
     // such: colouring it as if its value were 0, or leaving the last ground
     // truth colour in place, would hide exactly what the sensor layer exists to
     // reveal.
-    const SENSOR_NO_DATA_COLOR = [148, 163, 184, 235];
+    function sensorNoDataColor() { return [...tokenRgb('--proto-nodata-rgb'), 235]; }
 
     function sensorReadingFor(featureName, sensorType) {
         const b = matchBuildingId(featureName, sensorBuildings);
@@ -1918,17 +2337,17 @@
         const r = sensorReadingFor(featureName, sensorType);
         // Never reported, or the most recent report was a dropout → no data.
         if (!r || r.status === 'dropout' || r.value === null || typeof r.value !== 'number') {
-            return SENSOR_NO_DATA_COLOR;
+            return sensorNoDataColor();
         }
         const max = sensorMaxVals[sensorType] || 1;
         const intensity = Math.min(Math.abs(r.value) / max, 1.0);
         if (r.status === 'fault') {
             // A reading we have, but not one to trust: amber, off the value ramp.
-            return [245, 158, 11, 220];
+            return [...hexRgb(faultColor()), 220];
         }
         return r.value >= 0
-            ? [239, 68, 68, intensity * 255]
-            : [59, 130, 246, intensity * 255];
+            ? [...tokenRgb('--proto-heat-pos-rgb'), intensity * 255]
+            : [...tokenRgb('--proto-heat-neg-rgb'), intensity * 255];
     }
 
     let currentHoverInfo = null;
@@ -1982,13 +2401,13 @@
     }
 
     // --- Live Chart Logic ---
-    // 8-slot categorical palette validated for CVD separation and >=3:1 contrast
-    // against this dashboard's dark surface (#0f172a).
-    const CHART_COLORS = ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767', '#d55181', '#d95926'];
+    // Series colours are the frontend's SimulationResults.tsx palette, read from
+    // the --proto-chart-N tokens at paint time so a theme change re-colours them.
     const MAX_CHART_SERIES = 8;
     const MAX_HISTORY_POINTS = 2000;
     const RECENT_WINDOW = 400;
-    const FAULT_COLOR = '#f59e0b';
+    function chartColor(slot) { return tokens(`--proto-chart-${slot + 1}`); }
+    function faultColor() { return tokens('--proto-fault'); }
 
     // One chart implementation, two instances. The Live Chart's point storage
     // (step-ordered insertion + deterministic decimation) was fixed twice already;
@@ -2363,20 +2782,20 @@
 
         const allBuildings = ctx.allBuildings();
         if (allBuildings.length === 0) {
-            listEl.innerHTML = `<div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">${ctx.waitingHint}</div>`;
+            listEl.innerHTML = `<div class="list-hint">${ctx.waitingHint}</div>`;
             return;
         }
 
         const visible = allBuildings.filter(b => !query || b.toLowerCase().includes(query));
         if (visible.length === 0) {
-            listEl.innerHTML = '<div style="padding: 10px; color: var(--text-muted); font-size: 0.8rem;">No buildings match your search.</div>';
+            listEl.innerHTML = '<div class="list-hint">No buildings match your search.</div>';
             return;
         }
 
         const full = ctx.selected.size >= MAX_CHART_SERIES;
         listEl.innerHTML = visible.map(b => {
             const isSel = ctx.selected.has(b);
-            const color = isSel ? CHART_COLORS[ctx.selected.get(b)] : 'transparent';
+            const color = isSel ? chartColor(ctx.selected.get(b)) : 'transparent';
             const disabled = !isSel && full;
             return `<div class="building-item ${isSel ? 'selected' : ''} ${disabled ? 'disabled' : ''}"
                         onclick="${disabled ? '' : `toggleBuildingSelection('${key}','${b}')`}">
@@ -2458,7 +2877,7 @@
             // Decimated at render time from the full authoritative history, so the same
             // steps always draw the same line regardless of how they were scrubbed in.
             const points = chartPointsFor(ctx, param, b, ctx.rangeMode);
-            series.push({ building: b, color: CHART_COLORS[slot], points });
+            series.push({ building: b, color: chartColor(slot), points });
         }
         return { param, series };
     }
@@ -2543,8 +2962,8 @@
         const yTicks = niceTicks(minVal, maxVal, 7);
         yTicks.forEach(t => {
             if (t < minVal || t > maxVal) return;
-            out += `<line x1="${M.left}" y1="${y(t)}" x2="${M.left + iw}" y2="${y(t)}" stroke="#243247" stroke-width="1"/>`;
-            out += `<text x="${M.left - 8}" y="${y(t) + 3.5}" text-anchor="end" fill="#94a3b8" font-size="11" font-family="monospace">${fmtVal(t)}</text>`;
+            out += `<line x1="${M.left}" y1="${y(t)}" x2="${M.left + iw}" y2="${y(t)}" stroke="${tokens('--proto-chart-grid')}" stroke-width="1"/>`;
+            out += `<text x="${M.left - 8}" y="${y(t) + 3.5}" text-anchor="end" fill="${tokens('--coesi-text-muted')}" font-size="11" font-family="${tokens('--proto-font-mono')}">${fmtVal(t)}</text>`;
         });
         const span = maxX - minX;
         const xTicks = useTime
@@ -2552,16 +2971,16 @@
             : niceTicks(minX, maxX, 8).filter(t => t >= minX && t <= maxX && t % 1 === 0);
         const xTickLabel = useTime ? (t => fmtAxisTime(t, span)) : (t => String(t));
         xTicks.forEach(t => {
-            out += `<text x="${x(t)}" y="${M.top + ih + 18}" text-anchor="middle" fill="#94a3b8" font-size="11" font-family="monospace">${xTickLabel(t)}</text>`;
+            out += `<text x="${x(t)}" y="${M.top + ih + 18}" text-anchor="middle" fill="${tokens('--coesi-text-muted')}" font-size="11" font-family="${tokens('--proto-font-mono')}">${xTickLabel(t)}</text>`;
         });
         // Baseline axis
-        out += `<line x1="${M.left}" y1="${M.top + ih}" x2="${M.left + iw}" y2="${M.top + ih}" stroke="#475569" stroke-width="1"/>`;
+        out += `<line x1="${M.left}" y1="${M.top + ih}" x2="${M.left + iw}" y2="${M.top + ih}" stroke="${tokens('--coesi-border-strong')}" stroke-width="1"/>`;
         const axisTitle = useTime ? 'time' : 'step';
-        out += `<text x="${M.left + iw / 2}" y="${H - 2}" text-anchor="middle" fill="#64748b" font-size="10">${axisTitle}</text>`;
+        out += `<text x="${M.left + iw / 2}" y="${H - 2}" text-anchor="middle" fill="${tokens('--coesi-text-faint')}" font-size="10">${axisTitle}</text>`;
 
         // Crosshair (behind the lines)
         if (ctx.hoverX !== null && ctx.hoverX >= minX && ctx.hoverX <= maxX) {
-            out += `<line x1="${x(ctx.hoverX)}" y1="${M.top}" x2="${x(ctx.hoverX)}" y2="${M.top + ih}" stroke="#94a3b8" stroke-width="1"/>`;
+            out += `<line x1="${x(ctx.hoverX)}" y1="${M.top}" x2="${x(ctx.hoverX)}" y2="${M.top + ih}" stroke="${tokens('--coesi-text-muted')}" stroke-width="1"/>`;
         }
 
         // Series: 2px lines, round joins; end dot r=4 with 2px surface ring
@@ -2587,12 +3006,12 @@
             s.points.forEach(p => {
                 const xv = xOf(p);
                 if (p.status !== 'fault' || p.val === null || xv === null) return;
-                out += `<circle cx="${x(xv).toFixed(1)}" cy="${y(p.val).toFixed(1)}" r="4.5" fill="none" stroke="${FAULT_COLOR}" stroke-width="2"/>`;
+                out += `<circle cx="${x(xv).toFixed(1)}" cy="${y(p.val).toFixed(1)}" r="4.5" fill="none" stroke="${faultColor()}" stroke-width="2"/>`;
             });
 
             const last = lastRealPoint(s.points);
             if (last && xOf(last) !== null) {
-                out += `<circle cx="${x(xOf(last))}" cy="${y(last.val)}" r="4" fill="${s.color}" stroke="#0f172a" stroke-width="2"/>`;
+                out += `<circle cx="${x(xOf(last))}" cy="${y(last.val)}" r="4" fill="${s.color}" stroke="${tokens('--coesi-surface')}" stroke-width="2"/>`;
                 endLabels.push({ yPos: y(last.val), text: fmtVal(last.val) });
             }
 
@@ -2600,7 +3019,7 @@
             if (ctx.hoverX !== null) {
                 const hp = nearestPoint(s.points, ctx.hoverX, xOf);
                 if (hp && hp.val !== null && Math.abs(xOf(hp) - ctx.hoverX) <= span * 0.02) {
-                    out += `<circle cx="${x(xOf(hp))}" cy="${y(hp.val)}" r="4" fill="${s.color}" stroke="#0f172a" stroke-width="2"/>`;
+                    out += `<circle cx="${x(xOf(hp))}" cy="${y(hp.val)}" r="4" fill="${s.color}" stroke="${tokens('--coesi-surface')}" stroke-width="2"/>`;
                 }
             }
         });
@@ -2610,7 +3029,7 @@
             endLabels.sort((a, b) => a.yPos - b.yPos);
             endLabels.forEach((l, i) => {
                 if (i > 0 && l.yPos - endLabels[i - 1].yPos < 14) return;
-                out += `<text x="${M.left + iw + 8}" y="${l.yPos + 3.5}" fill="#cbd5e1" font-size="11" font-family="monospace">${l.text}</text>`;
+                out += `<text x="${M.left + iw + 8}" y="${l.yPos + 3.5}" fill="${tokens('--coesi-text-secondary')}" font-size="11" font-family="${tokens('--proto-font-mono')}">${l.text}</text>`;
             });
         }
 
@@ -2646,15 +3065,15 @@
                 // researcher checks "what was the value here?", so answering with a
                 // neighbouring number would be actively misleading.
                 const shown = p.val === null
-                    ? '<span style="color:#94a3b8;">— no reading</span>'
-                    : `<b>${fmtVal(p.val)}</b>${p.status === 'fault' ? ` <span style="color:${FAULT_COLOR};">⚠ fault</span>` : ''}`;
+                    ? '<span class="tt-muted">— no reading</span>'
+                    : `<b>${fmtVal(p.val)}</b>${p.status === 'fault' ? ` <span class="tt-fault">⚠ fault</span>` : ''}`;
                 rows.push(`<div class="tt-row"><span class="tt-dot" style="background:${s.color};"></span>${s.building}: ${shown}</div>`);
             }
         });
         if (rows.length === 0) { tt.style.display = 'none'; return; }
         // A sensor tooltip answers "when", not "which step".
         const header = useTime ? fmtFullTime(ctx.hoverX) : `Step ${ctx.hoverX}`;
-        tt.innerHTML = `<div style="color:#94a3b8; margin-bottom:3px;">${header}</div>` + rows.join('');
+        tt.innerHTML = `<div class="tt-muted" style="margin-bottom:3px;">${header}</div>` + rows.join('');
         tt.style.display = 'block';
         const wrap = chartEl(ctx, 'wrap');
         const px = xScale(ctx.hoverX);
@@ -2705,6 +3124,11 @@
         if (activeTab === 'chart') renderChart('sim');
         if (activeTab === 'sensors') renderChart('sensor');
     });
+
+    applyTheme();
+    buildPaceMenu();
+    updateTransportUI();
+    loadConfig();
 </script>
 </body>
 </html>

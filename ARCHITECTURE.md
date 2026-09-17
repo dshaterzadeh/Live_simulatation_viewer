@@ -34,6 +34,7 @@
 14. [Failure modes and their handling](#14-failure-modes-and-their-handling)
 15. [Known limitations and sharp edges](#15-known-limitations-and-sharp-edges)
 16. [Extension points](#16-extension-points)
+17. [Toward production: temporary and permanent](#17-toward-production-temporary-and-permanent)
 
 ---
 
@@ -161,9 +162,10 @@ flowchart LR
 | [engine.py](engine.py) | Engine federate: HDF5 replay through `ReplayController`, `apply_control` seam, setpoint acks | 290 |
 | [bridge.py](bridge.py) | Bridge federate: HELICS → MQTT telemetry (relocated publisher body), MQTT `_control/#` → HELICS | 390 |
 | [helics_broker.py](helics_broker.py) | In-process HELICS broker + run control (time barrier over MQTT); readiness sentinel; recycles after each federation | 280 |
-| [local_server.py](local_server.py) | Threaded static file server + `/proxy/` CORS-stripping reverse proxy, loopback-bound by default | 43 |
-| [mosquitto.conf](mosquitto.conf) | Dual-listener broker config (TCP + WebSockets, anonymous) | 6 |
-| [Dockerfile](Dockerfile) | One image for engine/bridge/helics-broker/sensors: python:3.11-slim + pinned `requirements.txt` + data | 18 |
+| [local_server.py](local_server.py) | Threaded static file server + `/config.json` (browser settings from `.env`) + `/proxy/` CORS stripper restricted to `URBANSIM_API_BASE` | 80 |
+| [config.py](config.py) | `require` / `optional` / `resolve`: every entry point's only route to configuration; no fallbacks, errors name the variable | 70 |
+| [.env.example](.env.example) | Every runtime setting, documented; copied to the git-ignored `.env`, which is **required** | 45 |
+| [Dockerfile](Dockerfile) | One image for engine/bridge/helics-broker/sensors: python:3.11-slim + pinned `requirements.txt`; no data, no arguments | 16 |
 | [docker-compose.yml](docker-compose.yml) | The whole stack: mosquitto + helics-broker (health-checked) → engine, bridge, sensors, frontend | 120 |
 | [run.sh](run.sh) | The one entry point: `up / down / restart / status / logs / dev` | 100 |
 | [requirements.txt](requirements.txt) | Pinned runtime deps, shared by the image and the host `.venv` | 6 |
@@ -590,7 +592,7 @@ default and meaning; it just lives on the side that uses it.
 | Flag | Default | Purpose |
 |---|---|---|
 | `--host` / `--port` | `localhost` / `1883` | Mosquitto |
-| `--topic` / `-t` | `sim/hdf5/data` | Base topic prefix (also roots `_control/*` and `_meta/run`) |
+| `--topic` / `-t` | `TOPIC` from `.env` | Base topic prefix (also roots `_control/*` and `_meta/run`) |
 | `--qos` | `0` | 0, 1 or 2 — telemetry only; `_meta/run` and setpoint acks are always QoS 1 |
 | `--client-id` | `hdf5_publisher` | MQTT client identifier |
 | `--helics-broker` / `--helics-core` | as above | |
@@ -683,9 +685,13 @@ consequences of the barrier design are worth knowing:
   the step it was granted at `t`.
 
 The engine sends `bye` and takes one more grant before `finalize`, so the final step is
-always delivered; the bridge exits on `bye` and, for an engine that died without saying
-so, when `engine_alive()` reports the engine's core `disconnected` (checked every 5 s;
-the broker's own watchdog tears the federation down in ~10 s).
+always delivered; the bridge exits **0** on `bye` (a finished bounded run stays finished)
+and **1** when `engine_alive()` reports the engine's core `disconnected` without a `bye`
+(checked every 5 s; the broker's own watchdog tears the federation down in ~10 s) — a
+crash or broker restart is a failure, and the non-zero exit is what lets
+`restart: on-failure` bring the bridge back to meet the restarted engine. It used to
+exit 0 in both cases, which left a restarted engine waiting forever for a second
+federate.
 
 ### 5B.4 The control seam: `apply_control`
 
@@ -733,6 +739,13 @@ probe of the port. A throwaway federate would be the literal probe, but with a f
 `<topic>/_meta/state` `{mode, pace, allowed_sim_time, period, at}` retained on every
 transition. If Mosquitto is unreachable the broker still serves the federation at its
 initial `--pace`; it just cannot be driven.
+
+`allowed` (the highest simulation time federates may be granted) only advances along the
+wall clock while *paced*; in free-run the barrier is cleared and the federates sprint past
+it. So `pause` and `set_pace` both re-anchor on `federates_time()` — the lowest granted
+time in the federation, from a `global_time` query — before touching the barrier.
+Without that, free-run → 6 h/s put the barrier hundreds of thousands of simulated seconds
+behind the engine and the run stalled until the wall clock had "caught up".
 
 A federation is static: it forms with exactly two members and ends when they leave.
 The broker process outlives federations — when one ends (a bounded `LOOP=0` pass, or a
@@ -1149,36 +1162,50 @@ which simulation it was derived from.
 
 ## 7. Component 2 — The Broker (Mosquitto)
 
-[mosquitto.conf](mosquitto.conf):
+There is no `mosquitto.conf` in the tree. The `mosquitto` service in
+[docker-compose.yml](docker-compose.yml) writes it at start-up from `.env`:
 
 ```
-listener 1883
+listener ${MQTT_PORT}
 protocol mqtt
 allow_anonymous true
 
-listener 9001
+listener ${MQTT_WS_PORT}
 protocol websockets
 allow_anonymous true
 ```
 
+so the two ports are declared once, in `.env`, and the port mappings and health check in
+the same service interpolate the same variables (`${MQTT_PORT:?}` fails the `up` if it is
+missing rather than guessing).
+
 Two listeners, one broker core, one shared subscription table. A message arriving over
-TCP on 1883 is delivered to any matching subscriber on 9001 with no bridging
-configuration — this is what lets a Python backend feed a browser directly.
+TCP on `MQTT_PORT` is delivered to any matching subscriber on `MQTT_WS_PORT` with no
+bridging configuration — this is what lets a Python backend feed a browser directly.
 
 `allow_anonymous true` disables authentication entirely. Acceptable only because the
 deployment is `localhost`-scoped; see §15.
 
-Runs as the `mosquitto` service in [docker-compose.yml](docker-compose.yml): the
-`eclipse-mosquitto:2` image with both ports published, the config bind-mounted read-only
-at `/mosquitto/config/mosquitto.conf`, and a health check that the bridge and sensor
-services wait on (§11.2).
+The `eclipse-mosquitto:2` image has both ports published and a health check that the
+bridge and sensor services wait on (§11.2).
 
 ---
 
 ## 8. Component 3 — The CORS proxy / static server (`local_server.py`)
 
-36 lines subclassing `http.server.SimpleHTTPRequestHandler`, serving two distinct roles
-on port **8002**.
+Subclasses `http.server.SimpleHTTPRequestHandler`, serving three roles on
+`FRONTEND_PORT`: static files, `/config.json`, and `/proxy/`.
+
+### 8.0 `/config.json` — the page's only source of settings
+
+The dashboard has no broker host, port or topic of its own. On load it fetches
+`/config.json`, which `local_server.py` builds from the same `.env` as every other
+process: `MQTT_WS_HOST`, `MQTT_WS_PORT`, `TOPIC`, `SENSORS_TOPIC`, `URBANSIM_API_BASE`
+and the optional `URBANSIM_PROJECT_ID`. The **Connect** button stays disabled until it
+arrives, and the Config drop-down says why if it does not — a page opened from `file://`
+or from another static server is plainly unconfigured rather than quietly pointed at a
+guessed `127.0.0.1:9001`. This is what guarantees the page and the bridge can never
+disagree about the topic.
 
 ### 8.1 Static serving with permissive headers
 
@@ -1204,9 +1231,11 @@ Logic:
 1. `self.path.split('/proxy/', 1)[1]` → extract everything after the marker.
 2. `urllib.parse.unquote(...)` → recover the original URL (the frontend encodes it
    with `encodeURIComponent`, so slashes and colons survive transport).
-3. `urllib.request.urlopen(...)` → **server-side** fetch. The same-origin policy is a
+3. Refuse (403) anything not under `URBANSIM_API_BASE` — the proxy exists for one API,
+   so it is not an open proxy even on loopback.
+4. `urllib.request.urlopen(...)` → **server-side** fetch. The same-origin policy is a
    browser construct; a Python process is unconstrained by it.
-4. Replay the upstream status code, then copy upstream headers **except** a filtered set:
+5. Replay the upstream status code, then copy upstream headers **except** a filtered set:
 
    | Dropped header | Why |
    |---|---|
@@ -1214,7 +1243,7 @@ Logic:
    | `transfer-encoding` | Upstream chunking does not apply — we write a complete buffered body |
    | `connection` | Hop-by-hop header, must not be forwarded |
 
-5. `self.wfile.write(res.read())` → stream the body through unchanged.
+6. `self.wfile.write(res.read())` → stream the body through unchanged.
 
 Any exception yields HTTP 500 with the exception text, plus a server-side log line —
 which is what makes upstream failures diagnosable rather than silently empty.
@@ -1223,11 +1252,12 @@ which is what makes upstream failures diagnosable rather than silently empty.
 
 The server runs as the `frontend` service in [docker-compose.yml](docker-compose.yml):
 a stock `python:3.11-slim` with `local_server.py` and the HTML **bind-mounted read-only**,
-so editing the dashboard is a browser reload, not an image rebuild. Two environment knobs
-exist: `PORT` (default 8002) and `BIND` (default `127.0.0.1`). Inside the container
-compose sets `BIND=0.0.0.0` — it has to listen on the container's interface — and maps
-the port as `127.0.0.1:8002:8002`, so on the host the open `/proxy/` endpoint is still
-only reachable from loopback.
+so editing the dashboard is a browser reload, not an image rebuild (`config.py` is
+mounted alongside). It reads `FRONTEND_PORT` and `FRONTEND_BIND` from `.env` like
+everything else. Inside the container compose overrides `FRONTEND_BIND=0.0.0.0` — it has
+to listen on the container's interface — and maps the port as
+`127.0.0.1:${FRONTEND_PORT}:${FRONTEND_PORT}`, so on the host the `/proxy/` endpoint is
+still only reachable from loopback.
 
 It is a `ThreadingHTTPServer`, so a slow upstream GeoJSON fetch no longer blocks static
 serving; and the dashboard requests `/proxy/…` as a **relative** URL, so the page works
@@ -1250,48 +1280,68 @@ The live chart uses **no charting library** — it is hand-built SVG (§9.5).
 
 ### 9.1 Shell and layout
 
-A flex column: fixed top bar + one active tab pane, `overflow: hidden` on `body` so only
-inner panes scroll. Design tokens are CSS custom properties on `:root`
-([:16-23](mqtt_web_tester.html#L16-L23)) — slate-900 surface `#0f172a`, slate-800 panel
-`#1e293b`, blue-500 primary `#3b82f6`.
+A flex column: a 56 px header + one active tab pane, `overflow: hidden` on `body` so
+only inner panes scroll. Design tokens are CSS custom properties on `:root` and
+`:root[data-theme="dark"]` — see *Visual language* below.
 
-`switchTab()` ([:828-847](mqtt_web_tester.html#L828-L847)) toggles `.active` on both the
-button and the pane, and performs **deferred work on activation**: `mapInstance.redraw()`
-for the map (Deck.gl mis-sizes if it was initialised while hidden), and a full
-list/dropdown/chart re-render for the chart tab. Panes that are not visible are not
-rendered into — an explicit cost control given the message rate.
+`switchTab()` toggles `.active` on both the button and the pane, and performs **deferred
+work on activation**: `mapInstance.redraw()` for the map (Deck.gl mis-sizes if it was
+initialised while hidden), and a full list/dropdown/chart re-render for the chart tab.
+Panes that are not visible are not rendered into — an explicit cost control given the
+message rate.
 
-The top bar carries the **Config drop-down** (connection inputs), the Connect button, the
-live `Step`/`Time` counters, the **transport bar**, the Raw Logs toggle, the
-**run-metadata badge**, and a status dot that gains a green glow via `box-shadow` when
-connected.
+**The header carries controls only, with fixed geometry.** Left to right: brand ·
+view tabs (a segmented pill) · `Config ▾` · **Connect** · ❚❚ / ⏭ · `pace ▾` · empty
+space · **Run info** · **Logs** · a connection dot. No item wraps and none is sized by
+its content: buttons have set widths (Connect is 104 px so *Connect* and *Disconnect*
+occupy the same box), the pace button is 100 px, and the one flexible element is the
+empty spacer. Every readout that changes while a run advances — step, simulated time,
+progress, run metadata — lives in the **Run drawer** instead, because a number that grows
+in the header moves everything to its right. Below 1400 px the brand subtitle goes,
+below 1100 px the brand; nothing else changes position at any width.
 
-**Config drop-down** ([:627-638](mqtt_web_tester.html#L627-L638)) — a `Config ▾` button
-over a labelled panel holding the three connection inputs (host `127.0.0.1`, port `9001`,
-topic `sim/coesi5/#`). They used to sit inline in the top bar; they are set once per
-session while the transport controls are used constantly, so they were folded behind a
-button to give the bar back its width. The element ids (`host`, `port`, `topic`) are
-unchanged, so `toggleConnection()` and `controlBase()` read them exactly as before — this
-is presentation only.
+**Config drop-down** — a `Config ▾` button over a panel (`.dropdown-panel`, styled as
+the app's dropdown menus: surface, 1 px border, 10 px radius, `--coesi-shadow`) holding
+the three connection inputs and the theme switch (Auto / Light / Dark). The inputs have
+**no values in the HTML**: `loadConfig()` fills them from `local_server.py`'s
+`/config.json` (§8.0) and enables **Connect** only once that has arrived; a page served
+without it says so in the panel instead of guessing an address. The element ids (`host`,
+`port`, `topic`) are what `toggleConnection()` and `controlBase()` read. It is
+**click-toggled** (`toggleConfig`): it contains inputs the user must travel into and type
+in, and a hover popover would close out from under the pointer. The pace panel uses the
+same mechanism; `closeDropdowns()` keeps at most one of the two open, and a document-level
+click outside either closes both. The header must never get `overflow: hidden` — it
+would clip these panels.
 
-Unlike `.meta-popover` (§9.1, hover-only CSS), this one is **click-toggled** via
-`toggleConfig()` ([:859-869](mqtt_web_tester.html#L859-L869)): it contains inputs the user
-must travel into and type in, and a hover popover would close out from under the pointer.
-A document-level `click` listener closes it on any click outside `#configWrap`, so the
-Connect button next to it also dismisses it.
+**Drawers** (`.drawer`, `toggleDrawer(id)`) — two overlay drawers on the right, in the
+look of the app's `RightDrawerShell` (370 px, `--coesi-surface-subtle`, 24 px padding,
+18 px/600 header), one open at a time, the opening button showing an `.open` state:
 
-**Transport bar** ([:646-664](mqtt_web_tester.html#L646-L664)) — a play/pause toggle, a
-`<input type=range>` scrubber, a `<current> / <last>` readout and a speed `<select>`
-(`0.25× … 500×`, default `1×`), placed immediately after the `Step:`/`Time:` block it
-mirrors. All three controls are `disabled` until the MQTT client connects
-([`setTransportEnabled`, :1002-1006](mqtt_web_tester.html#L1002-L1006)), since a transport
-control that silently does nothing is worse than one that is visibly unavailable.
+- **Run** (`#runPanel`): *State* — the run-state pill (`#lblRate`: running at *n* step/s
+  / paused / finished / free-run, coloured with `--proto-state-*`); *Progress* — the
+  read-only range (`#scrubber`), then Step, Position (simulated calendar time; step and
+  percentage in its tooltip) and Simulated time (`9d 14:00`, fixed width) as a key/value
+  list with tabular digits; *Run metadata* — the one-line summary (`#metaBadge`) and the
+  full `_meta/run` payload as aligned `key value` lines (`#metaPopover`).
+- **Logs** (`#logsPanel`): the raw MQTT message feed, rendered only while open.
 
-**Run-metadata badge** ([:670-672](mqtt_web_tester.html#L670-L672)) — a compact
-`run: <file>` chip next to the connection status, with a CSS-only hover popover
-(`.meta-badge:hover + .meta-popover`) listing every key of the `_meta/run` payload. It
-sits inside the status block deliberately: provenance belongs next to "am I connected
-and to what", and it lands in any screenshot of the header.
+The ids inside the Run drawer are the ones the transport code has always written to, so
+moving the readouts out of the header changed no logic.
+
+**Visual language.** The page is styled with coesi-frontend-main's design tokens so it
+can be merged into that app: section 1 of the `<style>` block is `src/index.css`'s
+`--coesi-*` palette verbatim (light on `:root`, dark on `:root[data-theme="dark"]`),
+section 2 (`--proto-*`) the run-state, chart, heat-ramp and map values the frontend only
+has inline today, and every component rule names the frontend counterpart it mirrors
+(the 56 px workspace header, 34 px / 8 px-radius buttons with the yellow `--coesi-accent`
+for the primary action, segmented pills for tabs and mode switches, Material-outlined
+inputs, the Tabulator table look, dropdown panels with `--coesi-shadow`). The script
+reads colours through `tokens()` — chart series, axes, heat ramp, deck.gl layers and the
+basemap URL are all tokens — so a theme change repaints everything and there are no
+colour literals in JS. Theme mode is `localStorage["coesi.theme"]` resolved to
+`<html data-theme>` before first paint, exactly as the frontend's `ThemeContext` does.
+Focus rings appear for keyboard focus only (`button:focus-visible`); a mouse click never
+leaves one behind. Text inputs keep their green focus border while being typed in.
 
 ### 9.2 Core state
 
@@ -1673,27 +1723,30 @@ controls at that publisher too, with nothing hard-coded.
 **Pace** (`onPaceChange`) — reads `paceSelect` and publishes
 `{"sim_seconds_per_second": <value>}`. The options are *simulated time per real second*
 (real time, 1 min/s, 10 min/s, 1 h/s, 6 h/s, 1 day/s) plus free-run, not multipliers of
-a delay: a real engine has no base delay to multiply. A native `<select>` rather than a
-slider is deliberate — the useful paces are a handful of discrete steps spanning five
-orders of magnitude, and it keeps the bar to *icon buttons + native inputs*. Free-run is
-"as fast as the federation can go": with this stand-in, ~145 steps/s in Docker, bounded
-by MQTT throughput (§5B.3); with a real engine, whatever its slowest model computes.
+a delay: a real engine has no base delay to multiply. The control is a **dropdown panel**
+(`#paceBtn` + `#paceMenu`, built by `buildPaceMenu()` from the options) styled like the
+Config panel; a hidden `<select id="paceSelect">` remains the value holder so
+`applyTransportState` (retained `_meta/state` → selected pace) and `onPaceChange` are
+unchanged, and `syncPaceButton()` keeps the button label and the active menu item in step
+with it. Free-run is "as fast as the federation can go": with this stand-in, ~145
+steps/s in Docker, bounded by MQTT throughput (§5B.3); with a real engine, whatever its
+slowest model computes.
 
-**Run control bar.** ▶/❚❚ (`togglePlayback`), ⏭ step (`stepOnce`, enabled only while
-paused), a read-only progress range, a **pace** `<select>` (`paceSelect`: 1, 60, 600,
-3600, 21600, 86400 simulated seconds per real second, and 0 = free-run) and an actual-rate
-label. Every button publishes to `_control/*` and is answered by the broker; the page
-shows the request optimistically and lets the retained `_meta/state` settle it
-(`applyTransportState`): `mode` drives the play/pause glyph and the step button, `pace`
-selects the matching option. `_meta/progress` (`applyProgress`) supplies `total_steps`,
-the `finished` flag, and the `pass`: when the pass changes the Live Chart history is
-cleared, so a loop wrap — or an RL episode reset, with a real engine — starts the chart
-over instead of overwriting the previous pass point by point.
+**Run control.** ▶/❚❚ (`togglePlayback`) and ⏭ step (`stepOnce`, enabled only while
+paused) sit in the header next to the pace button; the read-only progress range and the
+actual-rate pill are in the Run drawer. Every button publishes to `_control/*` and is
+answered by the broker; the page shows the request optimistically and lets the retained
+`_meta/state` settle it (`applyTransportState`): `mode` drives the play/pause glyph and
+the step button, `pace` selects the matching option. `_meta/progress` (`applyProgress`)
+supplies `total_steps`, the `finished` flag, and the `pass`: when the pass changes the
+Live Chart history is cleared, so a loop wrap — or an RL episode reset, with a real
+engine — starts the chart over instead of overwriting the previous pass point by point.
 
 **Dated progress.** `simTimeOfStep(step) = start_time + step × dt_seconds` from the
-retained `_meta/run`; the label reads e.g. `Sep 16 00:00 · 3%`, with the step numbers and
-the run's dated span in its tooltip. Until `_meta/run` arrives it falls back to
-`step / total`. The actual rate (`actualStepsPerSecond`) is measured from distinct step
+retained `_meta/run`; the Position row reads e.g. `Sep 16 00:00`, with the step numbers,
+percentage and the run's dated span in its tooltip, and Simulated time shows the run's
+elapsed simulation clock as `Dd HH:MM` (fixed width — the raw seconds grow to eight
+digits). Until `_meta/run` arrives Position falls back to `step / total`. The actual rate (`actualStepsPerSecond`) is measured from distinct step
 arrivals over the last ~3 s — `pace` is a request, the rate is what happened.
 
 **Setpoint panel** (Live Chart sidebar; `renderSetpointPanel`, `renderSetpointTargets`,
@@ -1711,8 +1764,8 @@ every active override from every ack received. Acks are routed in `onMessageArri
 **Provenance** (`applyRunMetadata`, [:981-991](mqtt_web_tester.html#L981-L991)) — stores
 the payload, adopts `n_steps` as `totalSteps` (which is what lets the scrubber be
 correctly bounded *before* the first telemetry message arrives, thanks to the retained
-message), sets the badge to the file's basename and renders the popover as aligned
-`key value` lines.
+message), sets the Run drawer's summary line to the file's basename and dated span, and
+renders the full payload beneath it as aligned `key value` lines.
 
 ### 9.9 View 4 — Sensors tab
 
@@ -1936,48 +1989,54 @@ listening on `_control/#` either — the stream looks "broken" when it has actua
 finished. The same applies to the sensor stream. `LOOP=0` gives the bounded one-shot
 pass for a finite, reproducible run.
 
-The compose file reads its flags from environment variables with defaults —
-`${LOOP_FLAG---loop}`, `${SENSOR_LOOP_FLAG---loop}`, `${SEED_FLAG-}`,
-`${SIM_START_FLAG-}`, `${PACE:-600}`, `${PERIOD:-600}` — so a bare `docker compose up`
-behaves like `./run.sh up` with no knobs set. (The no-colon `${VAR-default}` form is
-deliberate: an exported *empty* `LOOP_FLAG` must mean "no `--loop`", not "use the
-default".)
+The compose file passes **no flags** to any service. Every service gets `.env` verbatim
+through `env_file:` and each Python entry point reads it via [config.py](config.py); the
+only per-service `environment:` overrides are the three addresses that have to point at a
+container instead of the host (`MQTT_HOST: mosquitto`, `HELICS_BROKER_HOST:
+helics-broker`, `FRONTEND_BIND: 0.0.0.0`). What Compose itself needs — port mappings,
+health-check ports, the Mosquitto listeners, the data-file mount — it interpolates as
+`${VAR:?}`, which fails the `up` with the variable's name if it is missing. There are no
+defaults anywhere: a stale `.env` cannot silently run against a made-up port.
 
-`PACE` defaults to `600` (one 10-minute step per real second) rather than free-run
+`PACE=600` in `.env.example` (one 10-minute step per real second) rather than free-run
 because the *initial* pace should be watchable when the dashboard first opens — any
 other pace, including free-run, is one click away (§9.8). `PERIOD` is the file's dt and
-is passed to the broker and the bridge, which cannot read the file; the engine takes it
-from the source. `helics-broker` now also `depends_on: mosquitto` (healthy) because it is
-the run controller.
+is read by the broker and the bridge, which cannot read the file; the engine takes it
+from the source and refuses a file it cannot derive one from. `helics-broker` also
+`depends_on: mosquitto` (healthy) because it is the run controller. The HDF5 file is
+bind-mounted from `HDF5_FILE`, not baked into the image.
 
 ### 11.3 [run.sh](run.sh)
 
-A thin translator, not an orchestrator: everything about *what* runs is in compose;
-`run.sh` only turns the human-facing knobs into flags and picks a compose verb.
+A thin wrapper, not an orchestrator: everything about *what* runs is in compose;
+`run.sh` requires `.env`, exports it into the shell (a variable already exported by the
+caller wins, as it does for Compose), and picks a compose verb.
 
 ```bash
-./run.sh up                # build if needed, start all four services, print status
+cp .env.example .env       # once — run.sh refuses to start without it
+./run.sh up                # build if needed, start all six services, print status
 ./run.sh down              # stop and remove them
 ./run.sh restart
 ./run.sh status            # docker compose ps + the URL to open
-./run.sh logs [service]    # follow; default publisher
-./run.sh dev               # broker + frontend in Docker, publisher + sensors from .venv
-LOOP=0 ./run.sh up         # single bounded pass
+./run.sh logs [service]    # follow; default engine
+./run.sh dev               # Mosquitto + sensors + frontend in Docker, federation from .venv
+LOOP=0 ./run.sh up         # single bounded pass (shell export beats .env for this run)
 SEED=42 ./run.sh up        # reproducible sensor noise/faults
-DELAY=0.5 ./run.sh up      # baseline pace
+PACE=0 ./run.sh up         # free-run
 ```
 
-`export_flags` is the only logic: `LOOP=0` → `LOOP_FLAG=""` and
-`SENSOR_LOOP_FLAG=--no-loop` (the two CLIs spell "don't loop" differently); `SEED=n` →
-`SEED_FLAG="--seed n"`.
+There is no flag translation any more: `LOOP`, `SEED` and `SIM_START` are read by the
+scripts themselves (`--loop`/`--no-loop`, `--seed`, `--sim-start` remain as explicit
+overrides).
 
 `dev` exists because the federation is what changes while iterating and Mosquitto never
 does: it starts `mosquitto`, `sensors` and `frontend` in Docker, stops the Docker
-federation, then runs `helics_broker.py` (at `--pace 2000`), `bridge.py` and `engine.py`
-in the foreground from `.venv`, all killed by one Ctrl+C. The HELICS broker runs
-host-side too, not in Docker: a ZMQ core needs the broker to connect *back* to each
-federate's receive socket, which a broker inside Docker Desktop's VM cannot reliably do
-to processes on the Mac. Edit → Ctrl+C → re-run, no image rebuild.
+federation, then runs `helics_broker.py`, `bridge.py` and `engine.py` with no arguments
+in the foreground from `.venv` — `.env`'s host-side addresses are already in the
+environment — all killed by one Ctrl+C. The HELICS broker runs host-side too, not in
+Docker: a ZMQ core needs the broker to connect *back* to each federate's receive socket,
+which a broker inside Docker Desktop's VM cannot reliably do to processes on the Mac.
+Edit → Ctrl+C → re-run, no image rebuild.
 
 ### 11.4 Startup order
 
@@ -2318,9 +2377,139 @@ base topics (`sim/coesi5/baseline`, `sim/coesi5/retrofit`) and extend `parseData
 to carry the scenario as a fourth axis. The topic hierarchy already accommodates this
 without any broker reconfiguration.
 
+## 17. Toward production: temporary and permanent
+
+The HDF5 replay is a stand-in for a real HELICS co-simulation engine (CosimGym-style).
+This chapter answers, per component and function, what is deleted when that engine
+attaches, what stays, what has to be built, and in what order — with the system running
+at every step.
+
+### 17.1 The split
+
+```mermaid
+flowchart LR
+  subgraph T["TEMPORARY — HDF5 stand-in (deleted at swap)"]
+    direction TB
+    F["20260623_baseline.hdf5<br/>recorded ground truth"]
+    S["datasources/hdf5_source.py<br/>HDF5DataSource — only h5py import"]
+    C["replay/controller.py<br/>ReplayController — step order, passes, loop"]
+    E["engine.py<br/>HDF5 → HELICS engine federate"]
+    F --> S --> C --> E
+  end
+  subgraph M["THE SEAM — the contract (kept; a replacement must honour it)"]
+    direction TB
+    A["datasources/base.py<br/>SimulationDataSource ABC"]
+    W["federation.py<br/>PUB_RUN · PUB_STEP · EP_ENGINE · EP_BRIDGE · clock"]
+    N["engine adapter (NEW)<br/>wraps the real engine, speaks federation.py"]
+  end
+  subgraph P["PERMANENT — production spine (unchanged or extended)"]
+    direction TB
+    B["helics_broker.py<br/>broker + time-barrier run control"]
+    R["bridge.py<br/>HELICS ↔ MQTT"]
+    Q["mosquitto<br/>listeners from .env"]
+    D["mqtt_web_tester.html + local_server.py<br/>dashboard, /config.json"]
+    X["sensor_simulator.py<br/>cadence, calibration, faults"]
+    K["config.py · .env · docker-compose.yml · run.sh"]
+    B -. time barrier .- R
+    R -- "telemetry, _meta, acks" --> Q --> D
+    D -- "_control/#" --> Q
+    Q -- "_control/play·pause·step·pace" --> B
+    X -- "sensors/#" --> Q
+  end
+  S -. implements .-> A
+  E -- "HELICS pub/sub" --> W --> R
+  N -. "plugs in here" .-> W
+  S -. "own instance" .-> X
+```
+
+Left is the whole replay chain; it goes together, in one cut. The middle is the
+interface, not runtime code: two files that fix what an engine must publish and what a
+data source must offer. Everything on the right keeps running exactly as today, because
+pacing (the broker's barrier) and the wire format (`federation.py`, §6) never depended on
+what produces the data.
+
+### 17.2 Temporary — deleted at swap
+
+| Component | What it does today | At swap |
+|---|---|---|
+| `20260623_baseline.hdf5` | The recorded run: 289 datasets, 4320 steps, 600 s | deleted, with the `HDF5_FILE` key in `.env` and the bind mount in compose |
+| `datasources/hdf5_source.py` | `HDF5DataSource`: `/Series` reader, the only h5py import (§5.1) | deleted |
+| `replay/controller.py` | `ReplayController`: step order, `--start-step`/`--end-step`, passes/`LOOP`, provenance assembly (§5.2) | deleted — a live engine computes forward; it has no "pass over a recording" |
+| `engine.py` | The engine federate: wraps the two above, publishes `PUB_RUN` once and `PUB_STEP` per step, answers `EP_ENGINE` via `apply_control()` (§5B) | replaced by the adapter (17.4); its `apply_control` clamp ranges and couplings are stand-in physics |
+| `engine.py` flags `--explore`, `--start-step`, `--end-step`, `--loop/--no-loop` | replay semantics | gone with it |
+| `sensor_simulator.py`'s **data source** | its `HDF5DataSource` instance, and `SENSOR_SPECS` rows that name file variables (`TBuilding`, `T_ext`, `Tset`…) | the simulator stays (17.3); its source becomes live (17.5, phase 3) |
+| in the dashboard: `parseDatasetPath`, the `bui_\d+` regex, `BUI-0037` ↔ `bui_0037` map matching (§9.3, §9.6) | entity-naming assumptions of this file inside a permanent component | replaced by the engine's `PUB_RUN` catalog (phase 1) |
+
+### 17.3 Permanent — survives unchanged, or only extended
+
+| Component | Role | At swap |
+|---|---|---|
+| `federation.py` | the contract: names, payload shapes, `create_federate`, `engine_alive`, `finalize` (§5B.1) | unchanged; the adapter targets it |
+| `helics_broker.py` | broker + run control: play/pause/step/pace as a time barrier over `_control/#`, `_meta/state`, federation recycling (§5B.5) | unchanged — its own docstring: nothing to add for a CosimGym-style federate that requests time honestly |
+| `bridge.py` | HELICS → MQTT telemetry (latching zero filter, payload), `_meta/*`, `_control/setpoint/#` → `EP_ENGINE`, acks (§5B.2) | unchanged **only if** the adapter honours `federation.py` exactly — which is the point of building an adapter rather than rewriting the bridge |
+| `mosquitto` | MQTT transport, listeners written from `.env` (§7) | unchanged; add auth/TLS (17.6) |
+| `mqtt_web_tester.html` + `local_server.py` | the dashboard and its `/config.json` + proxy (§8, §9) | unchanged in function; merged into coesi-frontend-main (phase 4) |
+| `sensor_simulator.py` | cadence from `dt_seconds`, calibration, noise/drift/dropout/fault, `sensors/#`, `_meta/sensors`, no control channel (§5A) | mechanism stays; data source becomes live, or it retires in favour of real sensor ingestion |
+| `mqtt_tester.py` | terminal subscriber (§10) | unchanged |
+| `config.py`, `.env.example`, `docker-compose.yml`, `run.sh`, `Dockerfile` | one `.env`, no fallbacks; service topology; health ordering (§11) | shape unchanged; `HDF5_FILE` out, the real engine's own settings in |
+| `datasources/base.py` | `SimulationDataSource` ABC (§5.1) | kept as the seam, extended: `read_step(step)` assumes random access a live source cannot give (17.5, phase 1) |
+
+### 17.4 New — does not exist yet
+
+- **The engine adapter.** A federate that joins as `engine` (so the `engine_` core-name
+  prefix `engine_alive()` looks for still holds), publishes `PUB_RUN` once (`metadata`,
+  `catalog`, `controls`) and `PUB_STEP` per granted step, answers `EP_ENGINE` setpoints
+  with `EP_BRIDGE` acks that say what was *applied*, and sends `bye` before leaving —
+  wrapping the real engine (CosimGym's `ScenarioManager`/`BaseFederate`, or whatever
+  replaces it). It is selected by one `.env` switch and runs against the same broker,
+  bridge and page as the replay.
+- **Two known frictions for it.** CosimGym's own topic convention is
+  `<federate>.<instance>/<var>`, not `PUB_RUN`/`PUB_STEP`, so the adapter translates
+  rather than the bridge; and CosimGym has no pause/step/pace of its own — it does not
+  need one, because `helics_broker.py`'s barrier holds any federate that requests time
+  honestly. Run control is already engine-agnostic.
+- **A live `SimulationDataSource`.** Either a "next available step" variant of the ABC for
+  the sensor simulator, or the simulator fed from `PUB_STEP` values; decided in phase 1.
+
+### 17.5 Procedure — five phases, the system running throughout
+
+Each phase ends with the same proof: the bridge-parity, run-control and setpoint checks
+in CLAUDE.md pass unchanged, because nothing right of the seam is allowed to notice.
+
+| Phase | Work | Gate |
+|---|---|---|
+| **0 — done** | One `.env`, no fallbacks, errors that name the variable (§11); the page on coesi-frontend-main's tokens, configured from `/config.json` (§9.1) | static checks, `docker compose config`, DOM-shim smoke test |
+| **1 — harden the seam** | Dashboard builds building/model lists from `PUB_RUN`'s `catalog`, not the `bui_` regex. Decide the sensor simulator's live data path. Script the bridge-parity check so later phases run it in one command | parity against today's baseline sequence; dashboard renders a renamed entity set |
+| **2 — adapter, side by side** | Add the adapter as a second engine entry point; `ENGINE=hdf5\|cosim` in `.env` picks which the `engine` service runs. The replay stays as the regression reference | both engines pass run-control and setpoint checks against the same broker, bridge and page |
+| **3 — sensors** | Point the simulator at the live engine's values, or retire it for real sensor ingestion (CosimGym interface federates), keeping the `sensors/*` contract and `status` semantics | sensor-stream checks: cadence independence, dropout `null`, retained `_meta/sensors` |
+| **4 — frontend merge** | Port the page into coesi-frontend-main as a route: tokens already shared, `/config.json` → the app's config, the Paho client → a hook, the SVG chart kept (or recharts only with the ordering and decimation checks intact), the map onto the app's deck.gl 9 / react-map-gl; `local_server.py` dissolves into the app's server | CLAUDE.md's frontend checks, in the merged app |
+| **5 — retire the stand-in** | Delete `engine.py`, `datasources/hdf5_source.py`, `replay/`, the `.hdf5`, `HDF5_FILE`, the `ENGINE` switch. Production hardening (17.6) | the full check list once, on the production stack |
+
+### 17.6 What stays hardcoded, and why
+
+Every deployment value is in `.env` with no fallback. What remains literal is either
+**contract** (making it configurable would let two components disagree), **structure**
+(a fact of the architecture, not a choice), or **temporary** (goes with the stand-in):
+
+| Where | What | Verdict |
+|---|---|---|
+| `federation.py` | publication/endpoint names, payload keys, federate names, `engine_` prefix | contract — keep |
+| `helics_broker.py` | `--federates 2`, broker name, `--tick 2000 --timeout 10000`, 50 ms barrier tick, `/tmp/helics-broker.ready` | structure (the health check shares the sentinel path) — keep |
+| bridge / broker / sensors | `_meta/*`, `_control/*`, `…/ack`, QoS 1 + retained for the control plane, `status` vocabulary | wire protocol shared with the page — keep; `MQTT_QOS` covers the one delivery *choice* |
+| bridge / sensors | client ids | could be config; not needed — `TOPIC` namespaces a stack |
+| `docker-compose.yml` | image tags, container names, health cadence, restart policies, `allow_anonymous true`, the three container-host overrides | keep for the prototype; at phase 5 drop `container_name` and replace `allow_anonymous` with `MQTT_USERNAME`/`MQTT_PASSWORD` + TLS in `.env` |
+| the page | `/config.json`, `/proxy/`, the UrbanSim endpoint *path*, CDN URLs, pace presets, chart windows (8 / 2000 / 400), `coesi.theme`, the `--coesi-*` tokens | API contract, assets, UI ergonomics, the app's design system — keep |
+| `sensor_simulator.py` | `SENSOR_SPECS` | the one YAML candidate (`sensors.yaml`); deferred until the real engine fixes entity names, since each row names a source variable |
+| `hdf5_source.py`, `engine.py` | `/Series`, `time/t`, clamp ranges, couplings | temporary — deleted with the stand-in |
+
+There is no YAML today because the only structured configuration (sensor specs, the
+controls catalog) is either temporary or becomes the real engine's to publish.
+
+
 ---
 
 *Generated 2026-07-30 from the source tree at `/Users/david/Desktop/COESI5/HDF5`,
 revised the same day for the replay-controller refactor (`datasources/`, `replay/`,
-`_control/*`, `_meta/run`, dashboard transport bar). Line references are valid against
-the files as they stand at that revision.*
+`_control/*`, `_meta/run`, dashboard transport bar), and on 2026-09-17 for the
+single-`.env` configuration, the coesi-frontend-main visual language, the Run/Logs
+drawers and chapter 17. Older line references may be off by the lines added since.*

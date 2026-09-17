@@ -44,6 +44,8 @@ from typing import Any, Dict, Optional
 import helics as h
 import paho.mqtt.client as mqtt
 
+import config
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] helics_broker – %(message)s",
                     datefmt="%Y-%m-%dT%H:%M:%S", stream=sys.stdout, force=True)
 log = logging.getLogger("helics_broker")
@@ -186,6 +188,13 @@ class RunControl:
         with self.lock:
             self.pace = pace
             if self.mode != "paused":
+                # `allowed` only advances while paced; after a free-run the
+                # federates are far past it, and a barrier anchored there would
+                # stall them until the wall clock caught up. Anchor on where they
+                # actually are (never behind where they were already allowed).
+                now = federates_time(self.broker)
+                if now is not None:
+                    self.allowed = max(self.allowed, now)
                 self.mode = "free" if pace <= 0 else "paced"
                 self._anchor_wall = time.monotonic()
                 self._anchor_allowed = self.allowed
@@ -262,18 +271,28 @@ def connect_mqtt(control: RunControl, host: str, port: int) -> Optional[mqtt.Cli
 # ---------------------------------------------------------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="helics_broker")
+    parser = argparse.ArgumentParser(
+        prog="helics_broker",
+        description="HELICS broker + run control. Every flag overrides the .env variable named in its help.",
+    )
+    # The federation is static by design — exactly the engine and the bridge —
+    # so the count is a property of the architecture, not a deployment knob.
     parser.add_argument("--federates", type=int, default=2, help="Federates to wait for (engine + bridge).")
-    parser.add_argument("--port", type=int, default=23404)
-    parser.add_argument("--core", default="zmq")
-    parser.add_argument("--period", type=float, default=600.0,
-                        help="Simulation seconds per step (the federates' HELICS period).")
-    parser.add_argument("--pace", type=float, default=600.0,
-                        help="Initial pace in simulation seconds per real second; 0 = free-run.")
-    parser.add_argument("--mqtt-host", default="localhost")
-    parser.add_argument("--mqtt-port", type=int, default=1883)
-    parser.add_argument("--topic", "-t", default="sim/coesi5", help="Base topic for _control/# and _meta/state.")
+    parser.add_argument("--port", type=int, help="HELICS_BROKER_PORT")
+    parser.add_argument("--core", help="HELICS_CORE")
+    parser.add_argument("--period", type=float, help="PERIOD: simulation seconds per step.")
+    parser.add_argument("--pace", type=float, help="PACE: initial simulation seconds per real second; 0 = free-run.")
+    parser.add_argument("--mqtt-host", help="MQTT_HOST")
+    parser.add_argument("--mqtt-port", type=int, help="MQTT_PORT")
+    parser.add_argument("--topic", "-t", help="TOPIC: base topic for _control/# and _meta/state.")
     args = parser.parse_args()
+    args.port = config.resolve(args.port, "HELICS_BROKER_PORT", int)
+    args.core = config.resolve(args.core, "HELICS_CORE")
+    args.period = config.resolve(args.period, "PERIOD", float)
+    args.pace = config.resolve(args.pace, "PACE", float)
+    args.mqtt_host = config.resolve(args.mqtt_host, "MQTT_HOST")
+    args.mqtt_port = config.resolve(args.mqtt_port, "MQTT_PORT", int)
+    args.topic = config.resolve(args.topic, "TOPIC")
 
     stop = False
 

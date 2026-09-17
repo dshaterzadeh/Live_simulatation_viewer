@@ -4,6 +4,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local config (copy .env.example)
+.env
+
 # Runtime artefacts from the old host-side scripts and from ./run.sh dev
 *.log
 *.pid

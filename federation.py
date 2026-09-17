@@ -39,20 +39,18 @@ import helics as h
 
 log = logging.getLogger("hdf5_mqtt_publisher")
 
-#: Simulation seconds per step, used only as a default; the engine takes it
-#: from the source and the bridge/broker from --period.
-DEFAULT_PERIOD = 600.0
-
 PUB_RUN = "engine/run"
 PUB_STEP = "engine/step"
 EP_ENGINE = "engine/control"
 EP_BRIDGE = "bridge/control"
 
-DEFAULT_BROKER = "tcp://localhost:23404"
-DEFAULT_CORE = "zmq"
+# The period (simulation seconds per step), broker address and core type are
+# configuration, not contract: the engine takes the period from its source, the
+# bridge and broker from PERIOD, and all three take the broker from
+# HELICS_BROKER_HOST/PORT and HELICS_CORE (see config.py, .env.example).
 
 
-def create_federate(name: str, broker_address: str, period: float, core_type: str = DEFAULT_CORE) -> Any:
+def create_federate(name: str, broker_address: str, period: float, core_type: str) -> Any:
     """A combination federate (values + messages) joined to the shared broker,
     stepping on a `period` grid so grants land on whole steps."""
     info = h.helicsCreateFederateInfo()

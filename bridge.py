@@ -31,8 +31,9 @@ from typing import Any, Dict, List, Optional, Set
 import helics as h
 import paho.mqtt.client as mqtt
 
+import config
 from federation import (
-    DEFAULT_BROKER, DEFAULT_CORE, DEFAULT_PERIOD, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP,
+    EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP,
     create_federate, engine_alive, finalize,
 )
 
@@ -390,13 +391,18 @@ class Bridge:
                 break
             # Safety net for an engine that died without saying goodbye: once
             # it is gone our time requests are granted instantly, so this loop
-            # would otherwise spin forever.
+            # would otherwise spin forever. This is a failure, not a finish —
+            # exit non-zero so `restart: on-failure` brings the bridge back to
+            # meet the restarted engine, instead of leaving it waiting for a
+            # second federate that never comes.
             now = time.monotonic()
             if now - self._last_roster_check > 5.0:
                 self._last_roster_check = now
                 if not engine_alive(self.fed):
-                    log.warning("Engine is no longer in the federation; stopping.")
-                    break
+                    log.error("Engine vanished from the federation without saying goodbye "
+                              "(crash or broker restart) after %d steps; exiting to be restarted.",
+                              self.published_steps)
+                    return 1
             while not self.commands.empty():
                 cmd = self.commands.get_nowait()
                 h.helicsEndpointSendBytesTo(self.endpoint, json.dumps(cmd).encode(), EP_ENGINE)
@@ -412,22 +418,30 @@ class Bridge:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="bridge",
-        description="Bridges the HELICS engine federate to MQTT: telemetry out, control in.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Bridges the HELICS engine federate to MQTT: telemetry out, control in. "
+                    "Every flag overrides the .env variable named in its help.",
     )
-    parser.add_argument("--host", default="localhost", metavar="HOST", help="MQTT broker hostname or IP address.")
-    parser.add_argument("--port", type=int, default=1883, metavar="PORT", help="MQTT broker port.")
-    parser.add_argument("--topic", "-t", default="sim/hdf5/data", metavar="TOPIC", help="MQTT topic to publish to.")
-    parser.add_argument("--qos", type=int, choices=[0, 1, 2], default=0, metavar="QOS",
-                        help="MQTT Quality of Service level.")
+    parser.add_argument("--host", metavar="HOST", help="MQTT_HOST")
+    parser.add_argument("--port", type=int, metavar="PORT", help="MQTT_PORT")
+    parser.add_argument("--topic", "-t", metavar="TOPIC", help="TOPIC: base topic to publish under.")
+    parser.add_argument("--qos", type=int, choices=[0, 1, 2], metavar="QOS", help="MQTT_QOS for telemetry.")
     parser.add_argument("--client-id", default="hdf5_publisher", metavar="ID", help="MQTT client identifier.")
-    parser.add_argument("--helics-broker", default=DEFAULT_BROKER, metavar="ADDR", help="HELICS broker address.")
-    parser.add_argument("--helics-core", default=DEFAULT_CORE, metavar="TYPE", help="HELICS core type.")
-    parser.add_argument("--period", type=float, default=DEFAULT_PERIOD, metavar="SECONDS",
-                        help="Simulation seconds per step — must match the engine's and the broker's.")
+    parser.add_argument("--helics-broker", metavar="ADDR",
+                        help="HELICS broker address (tcp://HELICS_BROKER_HOST:HELICS_BROKER_PORT).")
+    parser.add_argument("--helics-core", metavar="TYPE", help="HELICS_CORE")
+    parser.add_argument("--period", type=float, metavar="SECONDS",
+                        help="PERIOD: simulation seconds per step — must match the engine's and the broker's.")
     parser.add_argument("--no-control", action="store_true",
                         help="Do not listen on <topic>/_control/setpoint/# .")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    args.host = config.resolve(args.host, "MQTT_HOST")
+    args.port = config.resolve(args.port, "MQTT_PORT", int)
+    args.topic = config.resolve(args.topic, "TOPIC")
+    args.qos = config.resolve(args.qos, "MQTT_QOS", int)
+    args.helics_broker = args.helics_broker or config.helics_broker_address()
+    args.helics_core = config.resolve(args.helics_core, "HELICS_CORE")
+    args.period = config.resolve(args.period, "PERIOD", float)
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:

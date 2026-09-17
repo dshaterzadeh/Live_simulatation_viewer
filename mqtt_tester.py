@@ -31,6 +31,8 @@ from typing import Any, Deque, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
 
+import config
+
 # ---------------------------------------------------------------------------
 # Optional rich import – fall back to plain print if not installed
 # ---------------------------------------------------------------------------
@@ -231,17 +233,22 @@ def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties=N
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="mqtt_tester",
-        description="Subscribe to an MQTT topic and display a live message feed.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Subscribe to an MQTT topic and display a live message feed. "
+                    "Every flag overrides the .env variable named in its help.",
     )
-    parser.add_argument("--host",         default="localhost", metavar="HOST")
-    parser.add_argument("--port",         type=int, default=1883, metavar="PORT")
-    parser.add_argument("--topic", "-t",  default="sim/coesi5/#", metavar="TOPIC",
-                        help="MQTT topic filter (wildcards supported: + and #)")
-    parser.add_argument("--qos",          type=int, choices=[0,1,2], default=0)
+    parser.add_argument("--host",         metavar="HOST", help="MQTT_HOST")
+    parser.add_argument("--port",         type=int, metavar="PORT", help="MQTT_PORT")
+    parser.add_argument("--topic", "-t",  metavar="TOPIC",
+                        help="MQTT topic filter, wildcards + and # (default: TOPIC/#)")
+    parser.add_argument("--qos",          type=int, choices=[0,1,2], help="MQTT_QOS")
     parser.add_argument("--max-messages", type=int, default=None, metavar="N",
                         help="Stop after receiving N messages (default: unlimited)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.host = config.resolve(args.host, "MQTT_HOST")
+    args.port = config.resolve(args.port, "MQTT_PORT", int)
+    args.topic = args.topic or f"{config.require('TOPIC')}/#"
+    args.qos = config.resolve(args.qos, "MQTT_QOS", int)
+    return args
 
 
 # ---------------------------------------------------------------------------

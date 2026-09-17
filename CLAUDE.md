@@ -27,12 +27,16 @@ The priorities that drive design decisions here, in order:
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the deep reference — every component, algorithm
 and contract with line-level pointers. Read the relevant chapter before changing a
-component; keep it updated when you change one.
+component; keep it updated when you change one. Its chapter 17 is the production path:
+which components are temporary (the HDF5 stand-in), which are permanent, what an engine
+adapter must honour, and the phased procedure for attaching the real co-simulation.
 
 ## Layout
 
 ```
 run.sh                     The one entry point: up / down / restart / status / logs / dev
+.env.example               Every runtime setting, documented; copy to .env (gitignored) — .env is required
+config.py                  require()/optional()/resolve(): how every script reads .env; no fallbacks
 docker-compose.yml         mosquitto + helics-broker (health-checked) → engine, bridge, sensors, frontend
 Dockerfile                 one image for engine / bridge / helics-broker / sensors (pinned via requirements.txt)
 federation.py              The HELICS contract: publication + endpoint names, payload shapes, clock
@@ -45,12 +49,15 @@ datasources/hdf5_source.py HDF5DataSource — the ONLY module that imports h5py
 replay/controller.py       ReplayController — which steps in what order, passes, dated provenance (no pacing)
 mqtt_web_tester.html       The entire frontend: CSS + markup + JS in one file
 mqtt_tester.py             Terminal subscriber (Rich TUI)
-local_server.py            Static server + /proxy/ CORS stripper for the UrbanSim API
-mosquitto.conf             Dual listener: TCP 1883 + WebSockets 9001
+local_server.py            Static server + /config.json for the page + /proxy/ CORS stripper for the UrbanSim API
 ```
 
+There is no `mosquitto.conf`: the compose file writes the listener config from `.env`
+at start-up, so `MQTT_PORT`/`MQTT_WS_PORT` are declared once.
+
 Dependency direction is strictly `datasources/ → replay/ → engine.py`, and
-`federation.py → {engine.py, bridge.py}`. `replay/` no longer imports `paho.mqtt` at
+`federation.py → {engine.py, bridge.py}`. `config.py` is imported by every entry point
+and imports nothing from the project. `replay/` no longer imports `paho.mqtt` at
 all — it is pure pacing plus control state. `bridge.py` never imports `datasources/`
 or `replay/`: everything it publishes came over HELICS. `sensor_simulator.py` is a
 *sibling* of the engine: it depends on `datasources/` only, never on `replay/`,
@@ -59,6 +66,7 @@ or `replay/`: everything it publishes came over HELICS. `sensor_simulator.py` is
 ## Running it
 
 ```bash
+cp .env.example .env # once; every setting lives here and nothing has a fallback
 ./run.sh up          # everything: both brokers, engine, bridge, sensors, frontend (Docker Compose)
                      # → http://localhost:8002/mqtt_web_tester.html → Connect
 ./run.sh logs        # follow the engine (./run.sh logs bridge|helics-broker|sensors|mosquitto|frontend)
@@ -77,10 +85,19 @@ Looping is the default and is the point: without it the replay ends after the la
 the federation dissolves, the bridge exits, and — since telemetry is QoS 0 and unretained
 — the dashboard has nothing to receive and nothing is listening on `_control/#`.
 `LOOP=0 ./run.sh up` gives a bounded one-shot run; `SEED=42 ./run.sh up` makes the sensor
-noise reproducible. Pace is a runtime concern: `PACE` (default 600 simulated seconds per
-real second = one step per second; `0` = free-run) is only the *initial* pace and the
-dashboard changes it live, so don't bake a fast value into the compose file. `PERIOD`
-(default 600) is the file's dt and must match on broker, bridge and engine.
+noise reproducible (a shell export wins over `.env` for that run, as it does for Compose).
+Pace is a runtime concern: `PACE` (600 simulated seconds per real second = one step per
+second; `0` = free-run) is only the *initial* pace and the dashboard changes it live, so
+don't bake a fast value into `.env`. `PERIOD` is the file's dt and must match on broker,
+bridge and engine.
+
+**Configuration has no fallbacks.** Every script resolves its settings through
+`config.py`: a CLI flag if given, else the `.env` variable named in the flag's `--help`,
+else a `config: X is not set` error naming the variable. `docker-compose.yml` uses
+`${VAR:?}` for the same reason and injects `.env` into every container with `env_file`;
+its only `environment:` overrides are the three addresses that must point at a container
+(`MQTT_HOST`, `HELICS_BROKER_HOST`, `FRONTEND_BIND`). The page gets its broker host,
+port and topic from `local_server.py`'s `/config.json`, never from values in the HTML.
 
 Host-side iteration (what to use while changing the Python):
 
@@ -93,15 +110,18 @@ needs the broker to connect *back* to each federate, which a broker inside Docke
 Desktop's VM cannot reliably do to processes on the Mac):
 
 ```bash
-.venv/bin/python helics_broker.py --federates 2 --port 23404 --period 600 --pace 2000 --mqtt-host 127.0.0.1 -t sim/coesi5
-.venv/bin/python bridge.py -t sim/coesi5 --period 600 --helics-broker tcp://127.0.0.1:23404
-.venv/bin/python engine.py -f 20260623_baseline.hdf5 --loop --helics-broker tcp://127.0.0.1:23404
-.venv/bin/python sensor_simulator.py -f 20260623_baseline.hdf5 -t sensors --delay 0.3 --seed 42
+set -a; . .env; set +a               # .env holds the host-side addresses (127.0.0.1)
+.venv/bin/python helics_broker.py
+.venv/bin/python bridge.py
+.venv/bin/python engine.py
+.venv/bin/python sensor_simulator.py --delay 0.3 --seed 42   # flags override .env
 ```
 
 `.venv/` is built from `requirements.txt` (h5py, paho-mqtt, numpy, rich, helics). Use
 `.venv/bin/python`, not bare `python3`. The frontend is bind-mounted into its container,
-so HTML edits only need a browser reload.
+so HTML edits only need a browser reload — unless the editor *replaced* the file (new
+inode: `sed -i`, `cat >`, most "atomic save" editors), which a single-file bind mount on
+Docker Desktop does not follow; then `docker compose up -d --force-recreate frontend`.
 
 Driving a running replay:
 
@@ -196,10 +216,29 @@ that reaches the engine. Unknown commands are logged and ignored.
 - The frontend has **no build step and no framework**. Add inline `<script>` handlers
   and CSS custom properties in the existing blocks; reuse the one already-instantiated
   Paho client rather than opening another.
-- The top bar is width-constrained, and the transport controls have first claim on it.
-  Broker host, port and topic live behind the **Config** drop-down; anything else set once
-  per session belongs there too, not inline. Keep the input ids (`host`, `port`, `topic`)
-  — `toggleConnection()` and `controlBase()` read them by id.
+- **The page is styled with coesi-frontend-main's tokens.** Section 1 of the `<style>`
+  block is `src/index.css`'s `--coesi-*` palette copied verbatim (paste over it when the
+  frontend's changes; never edit it here); section 2 (`--proto-*`) holds what this page
+  needs that the frontend has no token for yet, and is what to add to `index.css` when
+  merging. Component CSS and the script use only those tokens — the script reads them
+  through `tokens()`, so there are no colour literals in JS. Dark mode is
+  `<html data-theme>` from `localStorage["coesi.theme"]`, exactly as the frontend's
+  `ThemeContext` does; never `@media (prefers-color-scheme)` in CSS.
+- **The header carries controls only, with fixed geometry.** Tabs, Config, Connect,
+  play/pause/step, pace, Run info, Logs, the connection dot — every item a set width, no
+  wrapping, the empty spacer the only thing that flexes. Anything that *changes while the
+  run advances* (step, simulated time, progress, run metadata) goes in the **Run drawer**,
+  never in the header: a growing number moves everything to its right. Broker host, port
+  and topic live behind the **Config** drop-down; anything else set once per session
+  belongs there too. Keep the input ids (`host`, `port`, `topic`) — `toggleConnection()`
+  and `controlBase()` read them by id — and the readout ids (`lblStep`, `lblTime`,
+  `lblScrub`, `lblRate`, `scrubber`, `metaBadge`, `metaPopover`), which the transport code
+  writes wherever they live. Never put `overflow: hidden` on the header: it clips the
+  dropdown panels. New popovers use `.dropdown-panel` + `closeDropdowns()`; new side
+  panels use `.drawer` + `toggleDrawer()` — one of each open at a time.
+- `.env.example` keeps comments on their own lines: Docker's env-file parser treats a
+  trailing `# comment` as part of the value (it once handed the engine
+  `SIM_START='# optional…'`).
 - Prefer relocating code over rewriting it when refactoring — a pure move stays
   reviewable, and byte-identical output is then verifiable.
 

@@ -29,12 +29,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import helics as h
 
+import config
 from datasources import HDF5DataSource
 from datasources.hdf5_source import explore_hdf5
-from federation import (
-    DEFAULT_BROKER, DEFAULT_CORE, DEFAULT_PERIOD, EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP,
-    create_federate, finalize,
-)
+from federation import EP_BRIDGE, EP_ENGINE, PUB_RUN, PUB_STEP, create_federate, finalize
 from replay import ReplayController
 
 logging.basicConfig(
@@ -131,7 +129,7 @@ class Engine:
         self.pub_run = h.helicsFederateRegisterGlobalPublication(fed, PUB_RUN, h.HELICS_DATA_TYPE_STRING, "")
         self.pub_step = h.helicsFederateRegisterGlobalPublication(fed, PUB_STEP, h.HELICS_DATA_TYPE_STRING, "")
         self.endpoint = h.helicsFederateRegisterGlobalEndpoint(fed, EP_ENGINE, "")
-        self.period = controller.dt_seconds or DEFAULT_PERIOD
+        self.period = controller.dt_seconds
         self.time = 0.0            # HELICS time = simulation seconds, monotonic across passes
         self.overrides: Dict[Tuple[str, str], float] = {}
 
@@ -252,21 +250,31 @@ class Engine:
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="engine",
-        description="Replays an HDF5 simulation file into a HELICS federation, step by step.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description="Replays an HDF5 simulation file into a HELICS federation, step by step. "
+                    "Every flag overrides the .env variable named in its help.",
     )
-    parser.add_argument("--file", "-f", required=True, metavar="PATH", help="Path to the HDF5 file.")
+    parser.add_argument("--file", "-f", metavar="PATH", help="HDF5_FILE: path to the HDF5 file.")
     parser.add_argument("--explore", action="store_true", help="Print all datasets in the HDF5 file and exit.")
-    parser.add_argument("--helics-broker", default=DEFAULT_BROKER, metavar="ADDR", help="HELICS broker address.")
-    parser.add_argument("--helics-core", default=DEFAULT_CORE, metavar="TYPE", help="HELICS core type.")
-    parser.add_argument("--sim-start", default=None, metavar="ISO8601",
-                        help="Calendar instant of simulation time 0 (default: today at local midnight).")
+    parser.add_argument("--helics-broker", metavar="ADDR",
+                        help="HELICS broker address (tcp://HELICS_BROKER_HOST:HELICS_BROKER_PORT).")
+    parser.add_argument("--helics-core", metavar="TYPE", help="HELICS_CORE")
+    parser.add_argument("--sim-start", metavar="ISO8601",
+                        help="SIM_START: calendar instant of simulation time 0 (unset: today at local midnight).")
     parser.add_argument("--start-step", type=int, default=0, metavar="STEP", help="First step to replay.")
     parser.add_argument("--end-step", type=int, default=None, metavar="STEP",
                         help="Last step to replay (default: the last step in the file).")
-    parser.add_argument("--loop", action="store_true",
-                        help="Restart from --start-step after --end-step instead of terminating.")
-    return parser.parse_args(argv)
+    parser.add_argument("--loop", dest="loop", action="store_true", default=None,
+                        help="LOOP=1: restart from --start-step after --end-step instead of terminating.")
+    parser.add_argument("--no-loop", dest="loop", action="store_false", help="LOOP=0: one bounded pass.")
+    args = parser.parse_args(argv)
+    args.file = config.resolve(args.file, "HDF5_FILE")
+    if args.explore:
+        return args
+    args.helics_broker = args.helics_broker or config.helics_broker_address()
+    args.helics_core = config.resolve(args.helics_core, "HELICS_CORE")
+    args.sim_start = config.resolve_optional(args.sim_start, "SIM_START")
+    args.loop = config.resolve(args.loop, "LOOP", config.flag)
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -297,8 +305,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         source=source, start_step=args.start_step, end_step=args.end_step,
         loop=args.loop, sim_start=sim_start,
     )
-    fed = create_federate("engine", args.helics_broker, controller.dt_seconds or DEFAULT_PERIOD,
-                          args.helics_core)
+    if controller.dt_seconds is None:
+        log.error("%s has fewer than two time steps, so the period cannot be derived from it.", args.file)
+        return 1
+    fed = create_federate("engine", args.helics_broker, controller.dt_seconds, args.helics_core)
     engine = Engine(source, controller, fed)
     try:
         return engine.run()

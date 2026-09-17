@@ -50,6 +50,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import paho.mqtt.client as mqtt
 
+import config
 from datasources import HDF5DataSource, SimulationDataSource
 
 # ---------------------------------------------------------------------------
@@ -968,57 +969,63 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "Publishes synthetic, imperfect sensor readings derived from (and "
             "alongside) an HDF5 district simulation."
         ),
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog="Every flag overrides the .env variable named in its help.",
     )
 
-    # Not `required=True` only so `--list-types` can run without a file; main()
-    # enforces it for every path that actually reads data.
     parser.add_argument("--file", "-f", metavar="PATH",
-                        help="Path to the HDF5 file holding the ground truth.")
+                        help="HDF5_FILE: path to the HDF5 file holding the ground truth.")
 
-    parser.add_argument("--host", default="localhost", metavar="HOST",
-                        help="MQTT broker hostname or IP address.")
-    parser.add_argument("--port", type=int, default=1883, metavar="PORT",
-                        help="MQTT broker port.")
-    parser.add_argument("--topic", "-t", default="sensors", metavar="TOPIC",
-                        help="Base topic; readings go to <topic>/<building>/<sensor_type>.")
-    parser.add_argument("--qos", type=int, choices=[0, 1, 2], default=0, metavar="QOS",
-                        help="MQTT Quality of Service for readings.")
+    parser.add_argument("--host", metavar="HOST", help="MQTT_HOST")
+    parser.add_argument("--port", type=int, metavar="PORT", help="MQTT_PORT")
+    parser.add_argument("--topic", "-t", metavar="TOPIC",
+                        help="SENSORS_TOPIC: readings go to <topic>/<building>/<sensor_type>.")
+    parser.add_argument("--qos", type=int, choices=[0, 1, 2], metavar="QOS", help="MQTT_QOS for readings.")
     parser.add_argument("--client-id", default="sensor_simulator", metavar="ID",
                         help="MQTT client identifier.")
 
-    parser.add_argument("--delay", type=float, default=1.0, metavar="SECONDS",
-                        help="Wall-clock delay between source steps.")
+    parser.add_argument("--delay", type=float, metavar="SECONDS",
+                        help="SENSOR_DELAY: wall-clock delay between source steps.")
     parser.add_argument("--start-step", type=int, default=0, metavar="STEP",
                         help="First source step to sample.")
     parser.add_argument("--end-step", type=int, default=None, metavar="STEP",
                         help="Last source step to sample (default: the last step in the file).")
 
-    # Looping is the default: a sensor stream that silently stops after one pass
-    # leaves the dashboard with nothing to receive (readings are QoS 0 and
-    # unretained) — the same failure mode `build.sh` had.
-    parser.add_argument("--loop", dest="loop", action="store_true", default=True,
-                        help="Restart from --start-step after --end-step (default).")
+    # A sensor stream that silently stops after one pass leaves the dashboard
+    # with nothing to receive (readings are QoS 0 and unretained), so LOOP
+    # decides and the two flags are explicit overrides.
+    parser.add_argument("--loop", dest="loop", action="store_true", default=None,
+                        help="LOOP=1: restart from --start-step after --end-step.")
     parser.add_argument("--no-loop", dest="loop", action="store_false",
-                        help="Stop after one pass instead of looping.")
+                        help="LOOP=0: stop after one pass.")
 
-    parser.add_argument("--sim-start", default=None, metavar="ISO8601",
-                        help="Real-world datetime that the simulation's t=0 represents "
-                             "(default: today at local midnight). Each reading's "
-                             "'timestamp' is this plus its t.")
+    parser.add_argument("--sim-start", metavar="ISO8601",
+                        help="SIM_START: real-world datetime that the simulation's t=0 represents "
+                             "(unset: today at local midnight). Each reading's 'timestamp' is this plus its t.")
     parser.add_argument("--no-calibration", dest="calibrate", action="store_false",
                         default=True,
                         help="Publish raw source values instead of remapping them into "
                              "each sensor type's realistic range.")
 
-    parser.add_argument("--seed", type=int, default=None, metavar="N",
-                        help="Seed the noise/fault RNG for a reproducible run.")
+    parser.add_argument("--seed", type=int, metavar="N",
+                        help="SEED: seed the noise/fault RNG for a reproducible run (unset: random).")
     parser.add_argument("--types", default=None, metavar="LIST",
                         help="Comma-separated sensor types to publish (default: all).")
     parser.add_argument("--list-types", action="store_true",
                         help="Print the known sensor types and exit.")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.list_types:
+        return args
+    args.file = config.resolve(args.file, "HDF5_FILE")
+    args.host = config.resolve(args.host, "MQTT_HOST")
+    args.port = config.resolve(args.port, "MQTT_PORT", int)
+    args.topic = config.resolve(args.topic, "SENSORS_TOPIC")
+    args.qos = config.resolve(args.qos, "MQTT_QOS", int)
+    args.delay = config.resolve(args.delay, "SENSOR_DELAY", float)
+    args.loop = config.resolve(args.loop, "LOOP", config.flag)
+    args.sim_start = config.resolve_optional(args.sim_start, "SIM_START")
+    args.seed = config.resolve_optional(args.seed, "SEED", int)
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1034,10 +1041,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  {spec.type:22s} {spec.unit:6s} {scope:13s} ~{spec.interval_minutes:<9g} {rng_txt:24s} {origin}")
         print()
         return 0
-
-    if not args.file:
-        log.error("--file/-f is required.")
-        return 1
 
     types = [t.strip() for t in args.types.split(",")] if args.types else None
     if types:
