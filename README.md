@@ -413,6 +413,99 @@ bridge parity (the engine+bridge pair publishes byte-for-byte what the old singl
 publisher did), control behaviour, the setpoint round-trip, late-subscriber correctness,
 retained metadata, sensor realism and the chart's ordering/decimation invariants.
 
+## Migration to the real engine
+
+The HDF5 replay is temporary. The migration replaces the *left* of this picture and
+touches nothing on the *right*; the middle is the interface a replacement has to honour.
+
+```mermaid
+flowchart LR
+  subgraph T["TEMPORARY — deleted at swap"]
+    direction TB
+    F["20260623_baseline.hdf5"]
+    S["datasources/hdf5_source.py"]
+    C["replay/controller.py"]
+    E["engine.py"]
+    F --> S --> C --> E
+  end
+  subgraph M["THE SEAM — kept"]
+    direction TB
+    W["federation.py<br/>engine/run · engine/step<br/>engine/control · bridge/control"]
+    N["engine adapter (NEW)<br/>wraps CosimGym, speaks federation.py"]
+  end
+  subgraph P["PERMANENT — unchanged"]
+    direction TB
+    B["helics_broker.py<br/>time-barrier run control"]
+    R["bridge.py"]
+    Q["mosquitto"]
+    D["dashboard + local_server.py"]
+    X["sensor_simulator.py"]
+    K["config.py · .env · compose · run.sh"]
+  end
+  E -- "HELICS" --> W --> R
+  N -. "plugs in here" .-> W
+  B -. "barrier holds any federate" .- W
+```
+
+### What is deleted, what stays, what is built
+
+| | component | at swap |
+|---|---|---|
+| **temporary** | `engine.py`, `replay/controller.py`, `datasources/hdf5_source.py`, the `.hdf5`, `HDF5_FILE` in `.env` | deleted in one cut — a live engine computes forward, it has no "pass over a recording" |
+| **seam** | `federation.py` (publication + endpoint names, payload shapes, clock), `datasources/base.py` (source ABC) | kept — the adapter targets `federation.py`; the ABC gains a "next available step" variant for a live source |
+| **permanent** | `helics_broker.py`, `bridge.py`, Mosquitto, the dashboard, `local_server.py`, `sensor_simulator.py`, `config.py` / `.env` / compose / `run.sh` | unchanged — none of them ever depended on what produces the data |
+| **new** | **the engine adapter**: one federate wrapping CosimGym's `ScenarioManager` / `BaseFederate`s | selected by an `ENGINE=hdf5\|cosim` switch in `.env`; runs against the same broker, bridge and page |
+
+### What the adapter must honour
+
+This is `federation.py`, and it is the entire contract:
+
+1. Join the federation as **`engine`** (the broker's liveness check looks for the
+   `engine_` core-name prefix).
+2. Publish **`engine/run` once**: `{metadata, catalog, controls}` — provenance, the
+   entity/variable catalog the dashboard builds its lists from, and the controls
+   catalog (`entity, variable, units, min, max, couples`) that populates the setpoint
+   panel. Nothing about entities is hard-coded downstream.
+3. Publish **`engine/step` per granted step**: `{"step", "pass", "values": {entity:
+   {variable: value}}}`. CosimGym's own convention is `<federate>.<instance>/<var>`,
+   one typed publication per variable — the **adapter translates** into this shape,
+   the bridge does not learn a second one.
+4. **Request time honestly**: `request_time(t + period)`, publish when granted, never
+   sleep. That is all a federate does anyway — and it is what lets the broker's barrier
+   pause, step and pace it without CosimGym having any such feature.
+5. Answer **`engine/control` setpoints** with **`bridge/control` acks** that say what
+   was *applied* — clamped, rejected (`applied: null`), or cleared — never merely what
+   was requested. `apply_control()` in `engine.py` is the stand-in for this; the real
+   physics replaces it.
+6. Send **`bye`** before leaving, so the bridge finishes cleanly instead of timing out.
+
+The one topological requirement: **run control lives in the process that owns the root
+HELICS broker**, because the time barrier is a broker call. Either CosimGym's federation
+connects to `helics_broker.py` (the `.env` `HELICS_BROKER_HOST/PORT` already point at it —
+the natural route), or its `ScenarioManager` keeps spawning its own broker and the
+~100-line `RunControl` class moves into that process. Two knobs change: `--federates 2`
+becomes the real count, `PERIOD` the real scenario's step. Pause granularity is one step
+of whichever federate is slowest, because a federate is held at its *next* request.
+
+### Procedure — five phases, the system running throughout
+
+Every phase ends with the same proof: the bridge-parity, run-control and setpoint checks
+in [CLAUDE.md](CLAUDE.md) pass unchanged, because nothing right of the seam is allowed to
+notice.
+
+| phase | work | gate |
+|---|---|---|
+| **0 — done** | One `.env`, no fallbacks; the page on coesi-frontend-main's tokens, configured from `/config.json` | static checks, `docker compose config`, DOM-shim smoke test |
+| **1 — harden the seam** | Dashboard builds building/model lists from `engine/run`'s `catalog`, not the `bui_\d+` regex. Decide the sensor simulator's live data path. Script the bridge-parity check | parity against today's baseline; dashboard renders a renamed entity set |
+| **2 — adapter, side by side** | Add the adapter as a second engine entry point, `ENGINE=hdf5\|cosim` picks which the `engine` service runs. The replay stays as the regression reference | both engines pass run-control and setpoint checks against the same broker, bridge and page |
+| **3 — sensors** | Point the simulator at the live engine's values, or retire it for real sensor ingestion (CosimGym interface federates), keeping the `sensors/*` contract and `status` semantics | cadence independence, dropout `null`, retained `_meta/sensors` |
+| **4 — frontend merge** | Port the page into coesi-frontend-main as a route: tokens already shared, `/config.json` → the app's config, the Paho client → a hook, the chart kept with its ordering/decimation checks, the map onto the app's deck.gl; `local_server.py` dissolves into the app's server | the frontend checks, in the merged app |
+| **5 — retire the stand-in** | Delete `engine.py`, `datasources/hdf5_source.py`, `replay/`, the `.hdf5`, `HDF5_FILE`, the `ENGINE` switch. Production hardening: MQTT auth + TLS in `.env`, drop `allow_anonymous` | the full check list once, on the production stack |
+
+Chapter 17 of [ARCHITECTURE.md](ARCHITECTURE.md) is the per-function version of this —
+including what deliberately stays hardcoded (contract vs. structure vs. temporary) and
+why there is no YAML yet.
+
 ## Known limitations and next steps
 
 - **Local-machine trust model.** The broker allows anonymous connections and
