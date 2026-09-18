@@ -2395,39 +2395,43 @@ flowchart LR
     S["datasources/hdf5_source.py<br/>HDF5DataSource — only h5py import"]
     C["replay/controller.py<br/>ReplayController — step order, passes, loop"]
     E["engine.py<br/>HDF5 → HELICS engine federate"]
+    H["helics_broker.py — broker half<br/>helicsCreateBroker, --federates 2, recycle"]
     F --> S --> C --> E
   end
   subgraph M["THE SEAM — the contract (kept; a replacement must honour it)"]
     direction TB
     A["datasources/base.py<br/>SimulationDataSource ABC"]
     W["federation.py<br/>PUB_RUN · PUB_STEP · EP_ENGINE · EP_BRIDGE · clock"]
+    B["run_control.py (split from helics_broker.py)<br/>RunControl: _control/# → time barrier → _meta/state"]
     N["engine adapter (NEW)<br/>wraps the real engine, speaks federation.py"]
   end
   subgraph P["PERMANENT — production spine (unchanged or extended)"]
     direction TB
-    B["helics_broker.py<br/>broker + time-barrier run control"]
     R["bridge.py<br/>HELICS ↔ MQTT"]
     Q["mosquitto<br/>listeners from .env"]
     D["mqtt_web_tester.html + local_server.py<br/>dashboard, /config.json"]
     X["sensor_simulator.py<br/>cadence, calibration, faults"]
     K["config.py · .env · docker-compose.yml · run.sh"]
-    B -. time barrier .- R
     R -- "telemetry, _meta, acks" --> Q --> D
     D -- "_control/#" --> Q
-    Q -- "_control/play·pause·step·pace" --> B
     X -- "sensors/#" --> Q
   end
+  Q -- "_control/play·pause·step·pace" --> B
   S -. implements .-> A
   E -- "HELICS pub/sub" --> W --> R
   N -. "plugs in here" .-> W
+  H -- "hosts today" --> B
+  B -. "hosted by the real engine's broker process" .-> N
   S -. "own instance" .-> X
 ```
 
-Left is the whole replay chain; it goes together, in one cut. The middle is the
-interface, not runtime code: two files that fix what an engine must publish and what a
-data source must offer. Everything on the right keeps running exactly as today, because
-pacing (the broker's barrier) and the wire format (`federation.py`, §6) never depended on
-what produces the data.
+Left is the whole replay chain plus the broker process; it goes together, in one cut. The
+middle is the interface: two files that fix what an engine must publish and what a data
+source must offer, and one class — `RunControl` — that is runtime code but has to be
+*relocatable*, because the time barrier is a call on the broker object and the real
+engine (CosimGym's `ScenarioManager`) owns its own broker. Everything on the right keeps
+running exactly as today, because pacing (the barrier) and the wire format
+(`federation.py`, §6) never depended on what produces the data.
 
 ### 17.2 Temporary — deleted at swap
 
@@ -2438,6 +2442,7 @@ what produces the data.
 | `replay/controller.py` | `ReplayController`: step order, `--start-step`/`--end-step`, passes/`LOOP`, provenance assembly (§5.2) | deleted — a live engine computes forward; it has no "pass over a recording" |
 | `engine.py` | The engine federate: wraps the two above, publishes `PUB_RUN` once and `PUB_STEP` per step, answers `EP_ENGINE` via `apply_control()` (§5B) | replaced by the adapter (17.4); its `apply_control` clamp ranges and couplings are stand-in physics |
 | `engine.py` flags `--explore`, `--start-step`, `--end-step`, `--loop/--no-loop` | replay semantics | gone with it |
+| `helics_broker.py`, the **broker half**: `helicsCreateBroker`, `--federates 2`, the static two-federate federation, `engine_alive()` liveness, recycling (§5B.5) | the replay's HELICS broker | deleted — CosimGym's `ScenarioManager` creates the root broker; the run-control half moves (17.3) |
 | `sensor_simulator.py`'s **data source** | its `HDF5DataSource` instance, and `SENSOR_SPECS` rows that name file variables (`TBuilding`, `T_ext`, `Tset`…) | the simulator stays (17.3); its source becomes live (17.5, phase 3) |
 | in the dashboard: `parseDatasetPath`, the `bui_\d+` regex, `BUI-0037` ↔ `bui_0037` map matching (§9.3, §9.6) | entity-naming assumptions of this file inside a permanent component | replaced by the engine's `PUB_RUN` catalog (phase 1) |
 
@@ -2446,7 +2451,7 @@ what produces the data.
 | Component | Role | At swap |
 |---|---|---|
 | `federation.py` | the contract: names, payload shapes, `create_federate`, `engine_alive`, `finalize` (§5B.1) | unchanged; the adapter targets it |
-| `helics_broker.py` | broker + run control: play/pause/step/pace as a time barrier over `_control/#`, `_meta/state`, federation recycling (§5B.5) | unchanged — its own docstring: nothing to add for a CosimGym-style federate that requests time honestly |
+| `RunControl` (today inside `helics_broker.py`, lines 103–215; to be split into `run_control.py`) | run control: play/pause/step/pace as a time barrier over `_control/#`, `_meta/state`, `federates_time()` query (§5B.5) | **moves, unchanged in mechanism**: `helicsBrokerSetTimeBarrier` needs the broker handle, so the class is hosted by whichever process owns the root broker — CosimGym's `ScenarioManager` after the swap. Its interface is `RunControl(broker, period, pace, mqtt_client, topic)`; nothing about the federates behind the broker is assumed, so a CosimGym federation needs no change to be paused |
 | `bridge.py` | HELICS → MQTT telemetry (latching zero filter, payload), `_meta/*`, `_control/setpoint/#` → `EP_ENGINE`, acks (§5B.2) | unchanged **only if** the adapter honours `federation.py` exactly — which is the point of building an adapter rather than rewriting the bridge |
 | `mosquitto` | MQTT transport, listeners written from `.env` (§7) | unchanged; add auth/TLS (17.6) |
 | `mqtt_web_tester.html` + `local_server.py` | the dashboard and its `/config.json` + proxy (§8, §9) | unchanged in function; merged into coesi-frontend-main (phase 4) |
@@ -2467,8 +2472,17 @@ what produces the data.
 - **Two known frictions for it.** CosimGym's own topic convention is
   `<federate>.<instance>/<var>`, not `PUB_RUN`/`PUB_STEP`, so the adapter translates
   rather than the bridge; and CosimGym has no pause/step/pace of its own — it does not
-  need one, because `helics_broker.py`'s barrier holds any federate that requests time
-  honestly. Run control is already engine-agnostic.
+  need one, because the barrier holds any federate that requests time honestly. Run
+  control is already engine-agnostic.
+- **`run_control.py`** — the pure-move split of `RunControl` out of `helics_broker.py`,
+  so that CosimGym's `ScenarioManager` can `import` and start it after creating its
+  broker. `helics_broker.py` becomes its thin host for the replay and is deleted at
+  phase 5. Two alternatives were weighed and set aside: pointing CosimGym at
+  `helics_broker.py` (`HELICS_BROKER_HOST/PORT` exist for it — fine for phase-2
+  side-by-side tests, wrong as an end state: two broker owners), and a stand-alone
+  run-control *federate* setting the barrier through HELICS's command interface (would
+  leave CosimGym's process untouched; whether a federate may set a root barrier remotely
+  in 3.6 is unverified — an experiment before phase 2, not the plan).
 - **A live `SimulationDataSource`.** Either a "next available step" variant of the ABC for
   the sensor simulator, or the simulator fed from `PUB_STEP` values; decided in phase 1.
 
@@ -2480,11 +2494,11 @@ in CLAUDE.md pass unchanged, because nothing right of the seam is allowed to not
 | Phase | Work | Gate |
 |---|---|---|
 | **0 — done** | One `.env`, no fallbacks, errors that name the variable (§11); the page on coesi-frontend-main's tokens, configured from `/config.json` (§9.1) | static checks, `docker compose config`, DOM-shim smoke test |
-| **1 — harden the seam** | Dashboard builds building/model lists from `PUB_RUN`'s `catalog`, not the `bui_` regex. Decide the sensor simulator's live data path. Script the bridge-parity check so later phases run it in one command | parity against today's baseline sequence; dashboard renders a renamed entity set |
-| **2 — adapter, side by side** | Add the adapter as a second engine entry point; `ENGINE=hdf5\|cosim` in `.env` picks which the `engine` service runs. The replay stays as the regression reference | both engines pass run-control and setpoint checks against the same broker, bridge and page |
+| **1 — harden the seam** | Split `RunControl` into `run_control.py` (pure move, `helics_broker.py` its host). Dashboard builds building/model lists from `PUB_RUN`'s `catalog`, not the `bui_` regex. Decide the sensor simulator's live data path. Script the bridge-parity check so later phases run it in one command | run-control check passes unchanged; parity against today's baseline sequence; dashboard renders a renamed entity set |
+| **2 — adapter, side by side** | Add the adapter as a second engine entry point; `ENGINE=hdf5\|cosim` in `.env` picks which the `engine` service runs. CosimGym's `ScenarioManager` hosts `RunControl` beside its own broker (first tests may point CosimGym at `helics_broker.py` instead). The replay stays as the regression reference | both engines pass run-control and setpoint checks against the same bridge and page |
 | **3 — sensors** | Point the simulator at the live engine's values, or retire it for real sensor ingestion (CosimGym interface federates), keeping the `sensors/*` contract and `status` semantics | sensor-stream checks: cadence independence, dropout `null`, retained `_meta/sensors` |
 | **4 — frontend merge** | Port the page into coesi-frontend-main as a route: tokens already shared, `/config.json` → the app's config, the Paho client → a hook, the SVG chart kept (or recharts only with the ordering and decimation checks intact), the map onto the app's deck.gl 9 / react-map-gl; `local_server.py` dissolves into the app's server | CLAUDE.md's frontend checks, in the merged app |
-| **5 — retire the stand-in** | Delete `engine.py`, `datasources/hdf5_source.py`, `replay/`, the `.hdf5`, `HDF5_FILE`, the `ENGINE` switch. Production hardening (17.6) | the full check list once, on the production stack |
+| **5 — retire the stand-in** | Delete `engine.py`, `datasources/hdf5_source.py`, `replay/`, the `.hdf5`, `HDF5_FILE`, the `ENGINE` switch, and `helics_broker.py` (its broker job is CosimGym's; run control lives in `run_control.py`). Production hardening (17.6) | the full check list once, on the production stack |
 
 ### 17.6 What stays hardcoded, and why
 
@@ -2495,7 +2509,8 @@ Every deployment value is in `.env` with no fallback. What remains literal is ei
 | Where | What | Verdict |
 |---|---|---|
 | `federation.py` | publication/endpoint names, payload keys, federate names, `engine_` prefix | contract — keep |
-| `helics_broker.py` | `--federates 2`, broker name, `--tick 2000 --timeout 10000`, 50 ms barrier tick, `/tmp/helics-broker.ready` | structure (the health check shares the sentinel path) — keep |
+| `helics_broker.py` | `--federates 2`, broker name, `--tick 2000 --timeout 10000`, `/tmp/helics-broker.ready` | temporary — goes with the broker half at phase 5 |
+| `RunControl` | 50 ms barrier tick, half-period barrier offset | structure — keep, moves with the class |
 | bridge / broker / sensors | `_meta/*`, `_control/*`, `…/ack`, QoS 1 + retained for the control plane, `status` vocabulary | wire protocol shared with the page — keep; `MQTT_QOS` covers the one delivery *choice* |
 | bridge / sensors | client ids | could be config; not needed — `TOPIC` namespaces a stack |
 | `docker-compose.yml` | image tags, container names, health cadence, restart policies, `allow_anonymous true`, the three container-host overrides | keep for the prototype; at phase 5 drop `container_name` and replace `allow_anonymous` with `MQTT_USERNAME`/`MQTT_PASSWORD` + TLS in `.env` |

@@ -461,16 +461,17 @@ flowchart LR
     S["datasources/hdf5_source.py"]
     C["replay/controller.py"]
     E["engine.py"]
+    H["helics_broker.py<br/>creates the HELICS broker, waits for 2 federates"]
     F --> S --> C --> E
   end
   subgraph M["THE SEAM — kept"]
     direction TB
     W["federation.py<br/>engine/run · engine/step<br/>engine/control · bridge/control"]
+    B["run_control.py (split out of helics_broker.py)<br/>RunControl: MQTT _control/# → time barrier → _meta/state"]
     N["engine adapter (NEW)<br/>wraps CosimGym, speaks federation.py"]
   end
   subgraph P["PERMANENT — unchanged"]
     direction TB
-    B["helics_broker.py<br/>time-barrier run control"]
     R["bridge.py"]
     Q["mosquitto"]
     D["dashboard + local_server.py"]
@@ -479,16 +480,17 @@ flowchart LR
   end
   E -- "HELICS" --> W --> R
   N -. "plugs in here" .-> W
-  B -. "barrier holds any federate" .- W
+  H -- "hosts today" --> B
+  B -. "hosted by CosimGym's broker process after migration" .-> N
 ```
 
 ### What is deleted, what stays, what is built
 
 | | component | at swap |
 |---|---|---|
-| **temporary** | `engine.py`, `replay/controller.py`, `datasources/hdf5_source.py`, the `.hdf5`, `HDF5_FILE` in `.env` | deleted in one cut — a live engine computes forward, it has no "pass over a recording" |
-| **seam** | `federation.py` (publication + endpoint names, payload shapes, clock), `datasources/base.py` (source ABC) | kept — the adapter targets `federation.py`; the ABC gains a "next available step" variant for a live source |
-| **permanent** | `helics_broker.py`, `bridge.py`, Mosquitto, the dashboard, `local_server.py`, `sensor_simulator.py`, `config.py` / `.env` / compose / `run.sh` | unchanged — none of them ever depended on what produces the data |
+| **temporary** | `engine.py`, `replay/controller.py`, `datasources/hdf5_source.py`, the `.hdf5`, `HDF5_FILE` in `.env`; **the broker half of `helics_broker.py`** (create a broker, wait for two federates, recycle) | deleted in one cut — a live engine computes forward, it has no "pass over a recording"; and CosimGym brings its own HELICS broker |
+| **seam** | `federation.py` (publication + endpoint names, payload shapes, clock), `datasources/base.py` (source ABC), **`RunControl`** (the run-control half of `helics_broker.py`, to be split into `run_control.py`) | kept — the adapter targets `federation.py`; the ABC gains a "next available step" variant for a live source; `RunControl` moves into whatever process owns the root broker |
+| **permanent** | `bridge.py`, Mosquitto, the dashboard, `local_server.py`, `sensor_simulator.py`, `config.py` / `.env` / compose / `run.sh` | unchanged — none of them ever depended on what produces the data |
 | **new** | **the engine adapter**: one federate wrapping CosimGym's `ScenarioManager` / `BaseFederate`s | selected by an `ENGINE=hdf5\|cosim` switch in `.env`; runs against the same broker, bridge and page |
 
 ### What the adapter must honour
@@ -514,13 +516,45 @@ This is `federation.py`, and it is the entire contract:
    physics replaces it.
 6. Send **`bye`** before leaving, so the bridge finishes cleanly instead of timing out.
 
-The one topological requirement: **run control lives in the process that owns the root
-HELICS broker**, because the time barrier is a broker call. Either CosimGym's federation
-connects to `helics_broker.py` (the `.env` `HELICS_BROKER_HOST/PORT` already point at it —
-the natural route), or its `ScenarioManager` keeps spawning its own broker and the
-~100-line `RunControl` class moves into that process. Two knobs change: `--federates 2`
-becomes the real count, `PERIOD` the real scenario's step. Pause granularity is one step
-of whichever federate is slowest, because a federate is held at its *next* request.
+### The broker after migration
+
+`helics_broker.py` does two jobs in one process today, and they have different fates:
+
+| job | today | after migration |
+|---|---|---|
+| **A. the HELICS broker** — the "post office" every federate connects to: `helicsCreateBroker`, wait for `--federates 2`, recycle after each federation | `helics_broker.py` | **gone.** CosimGym's `ScenarioManager` creates its own broker; that is the root broker |
+| **B. run control** — subscribe to MQTT `_control/#`, move the time barrier, publish `_meta/state` (the `RunControl` class) | the same process | **kept, and moves.** The barrier is set on the *broker object* (`helicsBrokerSetTimeBarrier`), so whoever owns the broker must host `RunControl` — that is CosimGym's broker process |
+
+The process is deleted; the class moves. `RunControl` becomes a small importable module,
+`run_control.py`, that takes a broker handle, `PERIOD`, the initial pace and the MQTT
+settings — no `helicsCreateBroker`, no federate count, no recycling. CosimGym's
+`ScenarioManager` (or a thin wrapper around it) calls it right after creating its broker,
+and play/pause/step/pace hold the whole CosimGym federation with no model federate
+changed. `federates_time()` — the broker query `pause` uses to freeze where the federates
+actually are — works on any root broker and moves with it. `PERIOD`, the barrier
+quantum, becomes the smallest step in the federation; pause granularity is one step of
+the slowest federate, because a federate is held at its *next* time request.
+
+```
+TODAY                                          AFTER MIGRATION
+
+helics_broker.py        (ours)                 CosimGym ScenarioManager     (theirs)
+ ├─ HELICS broker         job A                 ├─ HELICS broker              theirs
+ └─ RunControl            job B                 ├─ RunControl                 ours, from run_control.py
+                                                └─ model federates            theirs
+engine.py  ─ replays the HDF5                      (buildings, heat pumps, weather, schedule …)
+     │ HELICS                                        │ HELICS
+bridge.py ─▶ Mosquitto ─▶ dashboard            bridge.py ─▶ Mosquitto ─▶ dashboard   (unchanged)
+sensors    ─ from the HDF5                     sensors    ─ live values, or real sensors
+```
+
+Two alternatives were considered. *Pointing CosimGym at our broker* (the `.env`
+`HELICS_BROKER_HOST/PORT` already exist) is fine for side-by-side testing in phase 2,
+but as an end state it leaves two broker owners and forces CosimGym not to spawn its own.
+*A separate run-control federate* sending the barrier through HELICS's command
+interface would avoid touching CosimGym's process at all; whether a federate may set a
+root barrier remotely in HELICS 3.6 is unverified, so it is an experiment to run before
+phase 2, not the plan.
 
 ### Procedure — five phases, the system running throughout
 
@@ -531,11 +565,11 @@ notice.
 | phase | work | gate |
 |---|---|---|
 | **0 — done** | One `.env`, no fallbacks; the page on coesi-frontend-main's tokens, configured from `/config.json` | static checks, `docker compose config`, DOM-shim smoke test |
-| **1 — harden the seam** | Dashboard builds building/model lists from `engine/run`'s `catalog`, not the `bui_\d+` regex. Decide the sensor simulator's live data path. Script the bridge-parity check | parity against today's baseline; dashboard renders a renamed entity set |
-| **2 — adapter, side by side** | Add the adapter as a second engine entry point, `ENGINE=hdf5\|cosim` picks which the `engine` service runs. The replay stays as the regression reference | both engines pass run-control and setpoint checks against the same broker, bridge and page |
+| **1 — harden the seam** | Split `RunControl` out of `helics_broker.py` into `run_control.py` (a pure move; `helics_broker.py` becomes its thin host). Dashboard builds building/model lists from `engine/run`'s `catalog`, not the `bui_\d+` regex. Decide the sensor simulator's live data path. Script the bridge-parity check | run-control check passes unchanged; parity against today's baseline; dashboard renders a renamed entity set |
+| **2 — adapter, side by side** | Add the adapter as a second engine entry point, `ENGINE=hdf5\|cosim` picks which the `engine` service runs. CosimGym's `ScenarioManager` hosts `RunControl` next to its own broker (for the first tests CosimGym may connect to `helics_broker.py` instead). The replay stays as the regression reference | both engines pass run-control and setpoint checks against the same bridge and page |
 | **3 — sensors** | Point the simulator at the live engine's values, or retire it for real sensor ingestion (CosimGym interface federates), keeping the `sensors/*` contract and `status` semantics | cadence independence, dropout `null`, retained `_meta/sensors` |
 | **4 — frontend merge** | Port the page into coesi-frontend-main as a route: tokens already shared, `/config.json` → the app's config, the Paho client → a hook, the chart kept with its ordering/decimation checks, the map onto the app's deck.gl; `local_server.py` dissolves into the app's server | the frontend checks, in the merged app |
-| **5 — retire the stand-in** | Delete `engine.py`, `datasources/hdf5_source.py`, `replay/`, the `.hdf5`, `HDF5_FILE`, the `ENGINE` switch. Production hardening: MQTT auth + TLS in `.env`, drop `allow_anonymous` | the full check list once, on the production stack |
+| **5 — retire the stand-in** | Delete `engine.py`, `datasources/hdf5_source.py`, `replay/`, the `.hdf5`, `HDF5_FILE`, the `ENGINE` switch, and `helics_broker.py` (its broker job is CosimGym's, its run control lives in `run_control.py`). Production hardening: MQTT auth + TLS in `.env`, drop `allow_anonymous` | the full check list once, on the production stack |
 
 Chapter 17 of [ARCHITECTURE.md](ARCHITECTURE.md) is the per-function version of this —
 including what deliberately stays hardcoded (contract vs. structure vs. temporary) and
