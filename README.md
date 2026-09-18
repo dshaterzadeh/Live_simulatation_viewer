@@ -1,29 +1,34 @@
 # Live Simulation Viewer
 
-Replay a district building-energy simulation as a live co-simulation, and inspect it in
-the browser — pause, step, set the pace, push a setpoint into the engine and watch the
-line move, see buildings light up on a 3D map — with a synthetic sensor network running
-alongside the ground truth.
+A browser dashboard for watching a district energy simulation run as a HELICS
+co-simulation, and for interfering with it while it runs: pause it, advance one step,
+slow it down or let it free-run, send a setpoint to the engine and see the effect in
+the next step. A synthetic sensor network runs next to the simulation so the dashboard
+can show "measured" readings side by side with the model's ground truth.
 
-The input is a single HDF5 file produced by the COESI/UrbanSim simulation engine
-(`20260623_baseline.hdf5`: 289 time series over 41 entities, 4 320 steps at 600 s
-resolution). A **HELICS engine federate** replays it step by step; a **bridge federate**
-carries each step onto MQTT and carries the dashboard's commands back; a third process
-derives noisy, imperfect *sensor readings* from the same file; one static HTML page
-subscribes to it all and renders a heat-map table, a live chart, a sensor view and a
-3D map.
+The simulation engine is currently a stand-in. Instead of a live model, `engine.py`
+replays a recorded run from an HDF5 file written by the COESI/UrbanSim engine
+(`20260623_baseline.hdf5`: 289 time series over 41 entities, 4320 steps of 600 s). It
+joins a HELICS federation as the engine federate and publishes one step at a time. A
+second federate, `bridge.py`, forwards each step to MQTT and passes setpoints from the
+dashboard back to the engine. `sensor_simulator.py` reads the same file and publishes
+noisy, sometimes missing or faulty sensor readings on a separate topic tree. The
+dashboard is one HTML file with no build step. It subscribes to everything and draws a
+table, a chart, a sensor view and a 3D map.
 
-The HDF5 replay is a stand-in. The engine/bridge split exists so that the real
-HELICS-based simulation engine (CosimGym-style: every model a federate, HELICS time =
-simulation time, running as fast as it computes) replaces exactly one federate —
-`engine.py` — and nothing else changes. That is also why **play, pause, step and pace
-are done by the HELICS broker with a time barrier**, not by the engine: they work on any
-federation without touching a model.
+The point of the replay is to have the whole chain working before the real engine
+exists. When the CosimGym-based engine is ready it takes the place of `engine.py` and
+nothing else changes: the bridge, the dashboard and the sensors only depend on the
+HELICS contract in `federation.py`. For the same reason, play, pause, step and pace are
+not implemented in the engine. They are done by the HELICS broker with a time barrier,
+which works for any federate that asks for time, including ones that were never written
+with a pause button in mind. See *Migration to the real engine* below.
 
-This is a **research tool, not a monitoring product**: there is no database, no
-server-side state, no build step and no test suite. The design priorities, in order, are
-interactive inspection, provenance (every run publishes what produced it; every setpoint
-is acknowledged with what was actually applied) and a swappable engine and data source.
+There is no database, no server-side state and no test suite; changes are verified
+against the running system (CLAUDE.md lists the checks). Two rules shaped most
+decisions: every run publishes what produced it, and every setpoint is acknowledged
+with what the engine actually applied, so a screenshot or a log line can always be
+traced back to its source.
 
 ---
 
@@ -329,6 +334,36 @@ Reserved sub-namespaces under the same base topic:
 There is no `_control/seek` and no `_control/speed`. New behaviour goes on new reserved
 topics — the telemetry payload shape is fixed, which is also why there is no `sim_time`
 field in it: it is `start_time + step × dt_seconds`, both in `_meta/run`.
+
+### Where topic names live
+
+Three layers, treated differently on purpose:
+
+- **Base topics are configuration.** `TOPIC` (`sim/coesi5`) and `SENSORS_TOPIC`
+  (`sensors`) come from `.env`. The bridge, broker and sensor simulator read them
+  through `config.py`; the page gets them from `/config.json`. Two stacks on one
+  Mosquitto only need two values of `TOPIC`.
+- **The reserved suffixes are protocol.** `_meta/run`, `_meta/state`, `_meta/progress`,
+  `_meta/controls`, `_control/play|pause|step|pace`, `_control/setpoint/…`, `…/ack` and
+  `sensors/_meta/sensors` are literals in `bridge.py`, `helics_broker.py`,
+  `sensor_simulator.py` and the page. They are not settings, deliberately: they are the
+  agreement between those four processes, and a setting would let two of them disagree.
+- **Entity and variable segments are data.** The bridge builds
+  `<TOPIC>/<entity>/<variable>` from the keys of the `values` object in each
+  `engine/step` message, and the page builds its building and model lists from what
+  arrives. Neither holds a list of names. (One leftover: the page groups buildings with
+  a `bui_\d+` regex; migration phase 1 replaces it with the engine's catalog.)
+
+On the HELICS side the four names in `federation.py` (`engine/run`, `engine/step`,
+`engine/control`, `bridge/control`) are hardcoded, and that is the contract. CosimGym's
+federates publish differently, one typed value per variable named
+`<federate>.<instance>/<var>`, and that difference is absorbed by the adapter translating
+into `engine/step`, not by the bridge learning CosimGym's names. If it later proves
+better for the bridge to subscribe to the federation's publications directly, HELICS can
+list them at runtime (a broker query for `publications`), so the bridge could discover
+them instead of being told. That would be a change to `federation.py` and `bridge.py`
+together, and nothing on the MQTT side would notice, because none of the three layers
+above depends on a HELICS name.
 
 Between the two federates the contract is `federation.py`: one string publication
 `engine/run` (metadata + attribute catalog + controls, once), one string publication
