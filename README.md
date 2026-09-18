@@ -162,6 +162,7 @@ else — Python only matters for host-side development.
 ```bash
 git clone https://github.com/dshaterzadeh/Live_simulatation_viewer.git
 cd Live_simulatation_viewer
+cp .env.example .env       # once — every runtime setting lives here; run.sh refuses to start without it
 ./run.sh up
 ```
 
@@ -171,6 +172,14 @@ Then open **http://localhost:8002/mqtt_web_tester.html** and click **Connect**.
 and then starts the engine, bridge, sensor simulator and dashboard server. The stack keeps
 running until `./run.sh down`.
 
+`.env` is the single source of truth and **nothing has a fallback**: `docker-compose.yml`
+injects it into every container, `run.sh` exports it for host-side runs, and every Python
+entry point reads it through `config.py` — a CLI flag if given, else the variable named in
+the flag's `--help`, else a `config: X is not set` error. A stale or half-copied `.env`
+therefore stops with the variable's name rather than silently running against a made-up
+port. The dashboard gets its broker host, port and topic from the same file via
+`local_server.py`'s `/config.json`; nothing is hard-coded in the HTML.
+
 ```bash
 ./run.sh status            # container states + the URL
 ./run.sh logs              # follow the engine   (also: logs bridge|helics-broker|sensors|mosquitto|frontend)
@@ -178,16 +187,25 @@ running until `./run.sh down`.
 ./run.sh down
 ```
 
-Knobs, all optional, all environment variables:
+The settings you are most likely to touch, with the value `.env.example` ships. A
+variable exported in the shell wins over `.env` for one run (`LOOP=0 ./run.sh up`), as it
+does for Compose; `.env.example` documents every other one.
 
-| knob | default | effect |
+| variable | in `.env.example` | effect |
 |---|---|---|
-| `PACE` | `600` | Initial pace in **simulated seconds per real second** (600 = one 10-minute step per second). `0` = free-run. Changed live from the dashboard |
-| `PERIOD` | `600` | Simulated seconds per step — the file's dt. Broker and bridge must agree with the engine |
+| `PACE` | `600` | Initial pace in **simulated seconds per real second** (600 = one 10-minute step per second). `0` = free-run. Changed live from the dashboard, so don't bake a fast value in |
+| `PERIOD` | `600` | Simulated seconds per step — the file's dt. Broker, bridge and engine all read it |
 | `LOOP` | `1` | `LOOP=0 ./run.sh up` replays once; the run then reads *finished* and the federation dissolves |
-| `SEED` | random | `SEED=42 ./run.sh up` makes sensor noise, dropouts and faults reproducible |
+| `SEED` | blank (random) | `SEED=42 ./run.sh up` makes sensor noise, dropouts and faults reproducible |
 | `SENSOR_DELAY` | `1.0` | Baseline pace of the sensor simulator, independent of `PACE` |
-| `SIM_START` | today, local midnight | Calendar instant of simulation time 0 (ISO 8601). Progress and the Live Chart axis are dated from it |
+| `SIM_START` | blank (today, local midnight) | Calendar instant of simulation time 0 (ISO 8601). Progress and the Live Chart axis are dated from it |
+| `MQTT_PORT` / `MQTT_WS_PORT` | `1883` / `9001` | Mosquitto's TCP and WebSocket listeners — declared once here; the compose file writes the listener config from them |
+| `TOPIC` / `SENSORS_TOPIC` | `sim/coesi5` / `sensors` | Base topics for telemetry (+ `_meta/*`, `_control/*`) and for the sensor stream |
+| `FRONTEND_PORT` | `8002` | Where `local_server.py` serves the page |
+
+`SEED` and `SIM_START` are the only optional ones — blank means "not set", never a guess.
+Keep comments in `.env` on their own lines: Docker's env-file parser treats a trailing
+`# comment` as part of the value.
 
 Looping is on by default for a reason: telemetry is QoS 0 and unretained, so an engine
 that exits after one pass dissolves the federation and leaves the dashboard with nothing
@@ -242,7 +260,14 @@ extruded and coloured by their live value. The *Ground truth / Sensor reading* t
 switches the colour source; in sensor mode a building with no current trustworthy reading
 renders in a flat grey that is deliberately outside the value scale.
 
-Broker host, port and base topic live behind the **Config** drop-down.
+Broker host, port and base topic live behind the **Config** drop-down, pre-filled from
+`/config.json` (i.e. from `.env`). Anything that changes while the run advances — step,
+simulated time, progress, provenance — lives in the **Run** drawer, so the header keeps a
+fixed geometry. The page is styled with coesi-frontend-main's `--coesi-*` design tokens
+(copied verbatim into the first `<style>` section, with a small `--proto-*` section for
+what this page needs and the frontend has no token for yet), and follows the same
+`<html data-theme>` / `localStorage["coesi.theme"]` dark-mode convention, so it drops
+into that frontend without a restyle.
 
 ## Driving the replay from a terminal
 
@@ -327,7 +352,9 @@ frontend function — are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```
 run.sh                      one entry point: up / down / restart / status / logs / dev
-docker-compose.yml          mosquitto + helics-broker (health-checked) → engine, bridge, sensors, frontend
+.env.example                every runtime setting, documented; copy to .env (gitignored) — .env is required
+config.py                   require() / optional() / resolve(): how every script reads .env; no fallbacks
+docker-compose.yml          mosquitto (listeners written from .env) + helics-broker (health-checked) → engine, bridge, sensors, frontend
 Dockerfile                  one image for engine / bridge / helics-broker / sensors, deps pinned via requirements.txt
 federation.py               the HELICS contract: publication + endpoint names, payload shapes, clock
 engine.py                   engine federate — HDF5 replay at simulation time, apply_control (the seam the real physics replaces), acks
@@ -339,18 +366,21 @@ datasources/hdf5_source.py  HDF5DataSource — the only module that imports h5py
 replay/controller.py        ReplayController — which steps in what order, passes, dated provenance (no pacing)
 mqtt_web_tester.html        the entire frontend, no framework, no build step
 mqtt_tester.py              terminal subscriber (Rich TUI)
-local_server.py             static server + /proxy/ CORS stripper for the GeoJSON API
-mosquitto.conf              two listeners: 1883 TCP, 9001 WebSockets
+local_server.py             static server + /config.json for the page + /proxy/ CORS stripper for the GeoJSON API
 20260623_baseline.hdf5      the reference simulation output (10 MB)
-ARCHITECTURE.md             the deep reference: every component, algorithm and contract
+ARCHITECTURE.md             the deep reference: every component, algorithm and contract (ch. 17: the production path)
+broker-pacing-pattern.md    the broker-owns-pacing pattern as a standalone note, independent of this code
 CLAUDE.md                   working conventions and invariants for the codebase
 ```
+
+There is no `mosquitto.conf`: the compose file writes the listener config from `.env` at
+start-up, so `MQTT_PORT` / `MQTT_WS_PORT` are declared once.
 
 ## Development
 
 Mosquitto never changes while iterating, the federation does. `dev` keeps Mosquitto,
 the sensors and the dashboard server in Docker and runs the HELICS broker, bridge and
-engine from a local venv in the foreground, at a faster pace, all stopped by one Ctrl+C:
+engine from a local venv in the foreground, all stopped by one Ctrl+C:
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # once
@@ -359,10 +389,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # once
 
 (The HELICS broker runs on the host in dev mode rather than in Docker: a ZMQ core needs
 the broker to connect *back* to each federate, which a broker inside Docker Desktop's VM
-cannot reliably do to processes on the Mac. Dev mode starts at `PACE=2000`.)
+cannot reliably do to processes on the Mac. The three processes take no arguments —
+`run.sh` has exported `.env`, whose host-side addresses are `127.0.0.1`. To run them by
+hand instead: `set -a; . .env; set +a`, then `.venv/bin/python helics_broker.py`,
+`bridge.py`, `engine.py`; a CLI flag such as `--pace 0` overrides `.env` for that process.)
 
 The dashboard is bind-mounted into its container, so editing `mqtt_web_tester.html` only
-needs a browser reload.
+needs a browser reload — unless the editor *replaced* the file (new inode: `sed -i`,
+most "atomic save" editors), which a single-file bind mount on Docker Desktop does not
+follow; then `docker compose up -d --force-recreate frontend`.
 
 Other useful commands:
 

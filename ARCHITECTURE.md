@@ -137,7 +137,8 @@ flowchart LR
 - **Broker → Browser over WebSocket 9001.** Browsers cannot open raw TCP sockets.
   Mosquitto is therefore configured with *two independent listeners* on the same
   broker core, so a message published on 1883 is routed to a subscriber on 9001
-  transparently ([`mosquitto.conf`](mosquitto.conf)).
+  transparently (the listener config is written from `.env` by
+  [docker-compose.yml](docker-compose.yml) at start-up — §7).
 - **Browser → Proxy → UrbanSim API.** The GeoJSON API returns no
   `Access-Control-Allow-Origin` header, so a direct `fetch()` from the page is
   blocked by the browser. `local_server.py` performs the request server-side —
@@ -1964,7 +1965,7 @@ the stack behaves the same on macOS, Linux and Windows.
 
 | service | image | role |
 |---|---|---|
-| `mosquitto` | `eclipse-mosquitto:2` | MQTT broker. Publishes 1883 (TCP) and 9001 (WebSockets); `mosquitto.conf` bind-mounted. **Health-checked** with a `mosquitto_sub -t '$SYS/#' -C 1` probe every 2 s. |
+| `mosquitto` | `eclipse-mosquitto:2` | MQTT broker. Publishes `MQTT_PORT` (TCP) and `MQTT_WS_PORT` (WebSockets); the listener config is written from `.env` at start-up, there is no `mosquitto.conf` (§7). **Health-checked** with a `mosquitto_sub -t '$SYS/#' -C 1` probe every 2 s. |
 | `helics-broker` | built from `Dockerfile`, entrypoint `helics_broker.py` | HELICS broker for exactly two federates **and the run control** (play/pause/step/pace over MQTT, as a time barrier). **Health-checked** on its own readiness sentinel plus a TCP probe of 23404 (§5B.5). Not published to the host. |
 | `engine` | same image (default entrypoint) | The engine federate. `depends_on: helics-broker: service_healthy`. |
 | `bridge` | same image, entrypoint `bridge.py` | The bridge federate. Waits for **both** brokers to be healthy. |
