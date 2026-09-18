@@ -2081,7 +2081,7 @@ sequenceDiagram
     loop every step — when the barrier lets it
         E->>K: request_time(t + 600)
         K-->>E: granted
-        E->>E: read_step; apply_overrides
+        E->>E: read_step · apply_overrides
         E->>P: HELICS engine/step {step, pass, values}
         P->>P: latch zero-filter
         P->>B: PUBLISH × ~175 topics (QoS 0) + _meta/progress (retained)
@@ -2097,7 +2097,7 @@ sequenceDiagram
     B-->>D: play/pause glyph, pace select settle from state
 
     Note over D: user applies a setpoint in the Live Chart sidebar
-    D->>B: PUBLISH sim/coesi5/_control/setpoint/<entity>/Qt {"value": 0}
+    D->>B: PUBLISH sim/coesi5/_control/setpoint/&lt;entity&gt;/Qt {"value": 0}
     B-->>P: setpoint listener → queue
     P->>E: HELICS EP_ENGINE {"command": "setpoint", …} at the next grant
     E->>E: validate, clamp, store override

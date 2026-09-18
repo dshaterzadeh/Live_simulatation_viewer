@@ -118,7 +118,7 @@ sequenceDiagram
         P->>P: latching zero filter
         P->>B: ~175 × sim/coesi5/entity/var {step, total_steps, dataset, attributes, values}
         P->>B: _meta/progress {step, pass, sim_time} — retained
-        B-->>D: table, chart, map repaint once; progress shows the simulated date
+        B-->>D: table, chart, map repaint once — progress shows the simulated date
     end
 
     Note over D,K: pause · step · pace
@@ -130,7 +130,7 @@ sequenceDiagram
     B-->>K: barrier advances 3600 sim-s per real second
 
     Note over D,E: setpoint
-    D->>B: _control/setpoint/<entity>/Qt {"value": 0}
+    D->>B: _control/setpoint/&lt;entity&gt;/Qt {"value": 0}
     B-->>P: setpoint listener → queue
     P->>E: HELICS {"command": "setpoint", …}  (delivered at the next grant)
     E->>E: validate · clamp · store override — next step publishes it
